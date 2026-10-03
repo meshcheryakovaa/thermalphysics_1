@@ -1,0 +1,1131 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Расчётный модуль к статье
+«Иерархия характерных времён и критерии осевой равномерности при
+термоактивируемом золь-гель осаждении кремнезёма в микроканале»
+(Вестник ТюмГУ. Физико-математическое моделирование. Нефть, газ, энергетика).
+
+Что считает файл (номера разделов — по плану рукописи):
+  3. Иерархия характерных времён, Pe_T, длина участка формирования L_e,
+     оценка скорости естественной конвекции.
+  4. Проточный режим: задача Гретца с условием третьего рода (точное Sh(Bi)),
+     k_эф, Da_эф, δ, Q_min.
+  5. Тепловое управление: E_эф, ΔT*, ослабление неоднородностей стенкой,
+     торцевые зоны, избирательность локального нагрева.
+  6. Статика: m_max, m(t)/m_max, Da_ст; закон сужения R_n, перепад давления,
+     сопротивление пережима, проницаемость (пучок капилляров, Козени — Кармен).
+  7. Численная проверка:
+     (1) Sh = 3,66 / 4,36 и решение Левека у входа;
+     (2) c̄(z), J(z): маршевое численное решение против аналитики;
+     (3) квазиизотермичность: прогрев порции золя в канале с нагретой стенкой;
+     (4) сеточная сходимость и материальный баланс;
+     (5) чувствительность Q_min и ΔT* к k_s, E, D;
+     (6) задача с подвижной границей R(z,t) при Q = const и Δp = const.
+  Рисунки 2–7 плана и два проверочных рисунка.
+
+ВНИМАНИЕ. k_s(T_ref), E, E_D, t_gel заданы ИЛЛЮСТРАТИВНО (в плане они ещё
+не взяты из литературы). Перед расчётом для рукописи замените значения в
+классе Params и укажите источники.
+
+Соглашение о числе Шервуда: Sh здесь определено по ДИАМЕТРУ, Sh = h·2R/D,
+поэтому Sh → 3,657 (стенка-сток) и Sh → 4,364 (постоянный поток). Тогда
+    k_эф = k_s / (1 + 2 k_s R / (Sh D)),   диффузионный предел k_эф = Sh D / (2R).
+В плане записано k_s R/(Sh D) и Sh D/R — это верно только для Sh по радиусу
+(1,83–2,18). Скрипт печатает это расхождение в разделе «Сверка с планом».
+
+Запуск:
+    python solgel_microchannel.py                # всё: отчёт, CSV, JSON, рисунки
+    python solgel_microchannel.py --quick        # грубые сетки, быстрее
+    python solgel_microchannel.py --no-figs      # без рисунков
+    python solgel_microchannel.py --out results  # каталог результатов
+Зависимости: numpy, scipy, matplotlib.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import math
+import os
+from dataclasses import dataclass, asdict, replace
+from functools import lru_cache
+
+import numpy as np
+from scipy import sparse
+from scipy.integrate import solve_ivp
+from scipy.optimize import brentq
+from scipy.special import j0, j1, jn_zeros
+
+# ---------------------------------------------------------------------------
+# Константы
+# ---------------------------------------------------------------------------
+R_GAS = 8.314462618        # Дж/(моль·К)
+M_SIO2 = 60.08e-3          # кг/моль
+G_ACC = 9.81               # м/с²
+UL_MIN = 1e-9 / 60.0       # 1 мкл/мин в м³/с
+DARCY = 9.869233e-13       # 1 Д в м²
+SH_DIRICHLET = 3.6568      # Sh_D, стенка-сток (Bi → ∞)
+SH_NEUMANN = 4.3636        # Sh_D, постоянный поток (Bi → 0)
+
+
+# ---------------------------------------------------------------------------
+# Параметры
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class Params:
+    # геометрия и режим
+    R: float = 250e-6            # радиус канала, м
+    L: float = 25e-3             # длина канала, м
+    delta_w: float = 1e-3        # толщина стенки, м (уточнить по образцам)
+    T_w: float = 333.15          # температура стенки, К
+    Q_ul_min: float = 1.0        # расход, мкл/мин
+    # перенос в золе (основа — этанол)
+    D: float = 1e-9              # коэффициент диффузии, м²/с
+    lam_sol: float = 0.17        # теплопроводность золя, Вт/(м·К)
+    rhoc_sol: float = 1.9e6      # ρc_p золя, Дж/(м³·К)  -> a ≈ 9·10⁻⁸ м²/с
+    mu: float = 1.0e-3           # вязкость, Па·с
+    rho_sol: float = 850.0       # плотность золя, кг/м³
+    beta_sol: float = 1.1e-3     # коэффициент объёмного расширения, 1/К
+    # стенка (ELEGOO Standard Resin, оценка)
+    lam_wall: float = 0.20       # Вт/(м·К)
+    rhoc_wall: float = 2.0e6     # Дж/(м³·К)        -> a_w ≈ 1·10⁻⁷ м²/с
+    h_loss: float = 10.0         # теплоотдача корпуса в воздух, Вт/(м²·К)
+    # кинетика (ИЛЛЮСТРАТИВНО — заменить литературными)
+    ks_ref: float = 1e-7         # k_s при T_ref, м/с
+    T_ref: float = 333.15        # К
+    E: float = 60e3              # энергия активации поверхностной реакции, Дж/моль
+    E_D: float = 14e3            # кажущаяся энергия активации диффузии (≈ вязкость EtOH)
+    k_v: float = 0.0             # объёмный расход на поликонденсацию, 1/с
+    t_gel: float = 3 * 3600.0    # время гелеобразования при 60 °C, с
+    # осадок
+    rho_layer: float = 2200.0    # плотность плотного SiO₂, кг/м³
+    # состав золя ТЭОС : EtOH : H2O : HCl (мольн.)
+    composition: tuple = (1.0, 8.0, 4.0, 0.24)
+
+    # --- производные величины ---
+    @property
+    def Q(self) -> float:
+        return self.Q_ul_min * UL_MIN
+
+    @property
+    def u_mean(self) -> float:
+        return self.Q / (math.pi * self.R ** 2)
+
+    @property
+    def a_sol(self) -> float:
+        return self.lam_sol / self.rhoc_sol
+
+    @property
+    def a_wall(self) -> float:
+        return self.lam_wall / self.rhoc_wall
+
+    @property
+    def nu(self) -> float:
+        return self.mu / self.rho_sol
+
+    @property
+    def c0(self) -> float:
+        return c0_from_composition(self.composition)
+
+    def ks(self, T: float | np.ndarray | None = None):
+        T = self.T_w if T is None else T
+        return self.ks_ref * np.exp(-self.E / R_GAS * (1.0 / T - 1.0 / self.T_ref))
+
+    @property
+    def Bi(self) -> float:
+        """Bi = k_s R / D — отношение скорости реакции к диффузионному подводу."""
+        return float(self.ks()) * self.R / self.D
+
+
+# ---------------------------------------------------------------------------
+# Состав золя
+# ---------------------------------------------------------------------------
+# (М, г/моль; ρ, г/см³) — ТЭОС, этанол, вода
+_COMPONENTS = {"TEOS": (208.33, 0.933), "EtOH": (46.07, 0.789), "H2O": (18.015, 0.997)}
+
+
+def c0_from_composition(comp=(1.0, 8.0, 4.0, 0.24)) -> float:
+    """Концентрация Si, моль/м³, по аддитивности мольных объёмов.
+    HCl (0,24) в объёме не учитывается; смешение без изменения объёма."""
+    n_teos, n_etoh, n_h2o, _ = comp
+    V = 0.0
+    for n, key in ((n_teos, "TEOS"), (n_etoh, "EtOH"), (n_h2o, "H2O")):
+        M, rho = _COMPONENTS[key]
+        V += n * M / rho                         # см³
+    return n_teos / (V * 1e-6)                   # моль/м³
+
+
+# ---------------------------------------------------------------------------
+# Раздел 3. Иерархия характерных времён
+# ---------------------------------------------------------------------------
+def time_scales(p: Params, Q_range=(0.1, 2.0)) -> dict:
+    u_hi = Q_range[1] * UL_MIN / (math.pi * p.R ** 2)
+    u_lo = Q_range[0] * UL_MIN / (math.pi * p.R ** 2)
+    return {
+        "t_heat_sol": p.R ** 2 / p.a_sol,
+        "t_heat_wall": p.delta_w ** 2 / p.a_wall,
+        "t_diff_radial": p.R ** 2 / p.D,
+        "t_res_min": p.L / u_hi,
+        "t_res_max": p.L / u_lo,
+        "t_gel": p.t_gel,
+    }
+
+
+def thermal_peclet(p: Params) -> float:
+    """Pe_T = ū R / a."""
+    return p.u_mean * p.R / p.a_sol
+
+
+def entry_length(Q: float, D: float) -> float:
+    """Участок формирования концентрационного профиля L_e ≈ 0,05·Re·Sc·d = 0,2 Q/(π D)."""
+    return 0.2 * Q / (math.pi * D)
+
+
+def natural_convection_velocity(p: Params, grad_T: float) -> float:
+    """Оценка скорости естественной конвекции в ГОРИЗОНТАЛЬНОМ канале,
+    вызванной осевым градиентом температуры стенки G = dT_w/dz
+    (течение Бириха в слое толщиной d = 2R с твёрдыми стенками):
+        u_max = g β G d³ / (72·√3·ν).
+    Для круглой трубы — оценка по порядку величины."""
+    d = 2.0 * p.R
+    return G_ACC * p.beta_sol * grad_T * d ** 3 / (72.0 * math.sqrt(3.0) * p.nu)
+
+
+# ---------------------------------------------------------------------------
+# Раздел 4. Задача Гретца с условием третьего рода
+# ---------------------------------------------------------------------------
+def _graetz_shoot(beta: float, Bi: float):
+    """Интегрирует φ'' + φ'/η + 2β(1-η²)φ = 0, φ(0)=1, φ'(0)=0.
+    Состояние: [φ, ψ = ηφ', I = 4∫(1-η²)φη dη]. Возвращает φ(1), φ'(1), φ_b."""
+    e0 = 1e-6
+    y0 = [1.0 - 0.5 * beta * e0 ** 2, -beta * e0 ** 2, 0.0]
+
+    def rhs(eta, y):
+        phi, psi, _ = y
+        return [psi / eta, -2.0 * beta * eta * (1.0 - eta ** 2) * phi,
+                4.0 * eta * (1.0 - eta ** 2) * phi]
+
+    sol = solve_ivp(rhs, (e0, 1.0), y0, rtol=1e-11, atol=1e-13, method="DOP853")
+    phi1, psi1, I = sol.y[:, -1]
+    return phi1, psi1, I
+
+
+def _residual(beta: float, Bi: float) -> float:
+    phi1, dphi1, _ = _graetz_shoot(beta, Bi)
+    if math.isinf(Bi):
+        return phi1
+    return dphi1 + Bi * phi1
+
+
+@lru_cache(maxsize=4096)
+def graetz_first_mode(Bi: float) -> dict:
+    """Первое собственное значение β₁ (c̄ ∝ exp(-β₁ ζ), ζ = zD/(ūR²)),
+    точное Sh_D(Bi) и k_эф/k_s. Для Bi = inf — стенка-сток."""
+    if math.isinf(Bi):
+        hi = 3.9
+    else:
+        hi = min(2.0 * Bi, 3.9) * (1 + 1e-9) + 1e-14
+    lo = hi * 1e-3 if not math.isinf(Bi) else 1.0
+    # сканирование до смены знака
+    grid = np.linspace(lo, hi, 60)
+    vals = [_residual(b, Bi) for b in grid]
+    beta1 = None
+    for k in range(len(grid) - 1):
+        if vals[k] == 0.0:
+            beta1 = grid[k]
+            break
+        if np.sign(vals[k]) != np.sign(vals[k + 1]):
+            beta1 = brentq(_residual, grid[k], grid[k + 1], args=(Bi,), xtol=1e-14, rtol=1e-12)
+            break
+    if beta1 is None:
+        raise RuntimeError(f"не найден корень Гретца для Bi={Bi}")
+    phi1, dphi1, phib = _graetz_shoot(beta1, Bi)
+    Sh = 2.0 * (-dphi1) / (phib - phi1)
+    keff_over_ks = (phi1 / phib) if not math.isinf(Bi) else 0.0
+    return {"beta1": beta1, "Sh_D": Sh, "keff_over_ks": keff_over_ks,
+            "phi_wall": phi1, "phi_bulk": phib}
+
+
+_SH_TABLE = None
+
+
+def sh_of_bi(Bi):
+    """Sh_D(Bi) по интерполяции точной таблицы (log Bi)."""
+    global _SH_TABLE
+    if _SH_TABLE is None:
+        bis = np.geomspace(1e-4, 1e4, 49)
+        _SH_TABLE = (np.log(bis), np.array([graetz_first_mode(float(b))["Sh_D"] for b in bis]))
+    lb, sh = _SH_TABLE
+    x = np.log(np.clip(np.asarray(Bi, dtype=float), 1e-4, 1e4))
+    return np.interp(x, lb, sh)
+
+
+def k_eff(ks, R, D, Sh=None):
+    """Последовательные сопротивления реакции и диффузии (Sh по диаметру)."""
+    ks = np.asarray(ks, dtype=float)
+    if Sh is None:
+        Sh = sh_of_bi(ks * R / D)
+    return ks / (1.0 + 2.0 * ks * R / (Sh * D))
+
+
+def da_eff(p: Params, Q: float | None = None) -> float:
+    Q = p.Q if Q is None else Q
+    u = Q / (math.pi * p.R ** 2)
+    ke = float(k_eff(p.ks(), p.R, p.D))
+    return 2.0 * ke * p.L / (p.R * u) + p.k_v * p.L / u
+
+
+def nonuniformity(Da):
+    return 1.0 - np.exp(-np.asarray(Da))
+
+
+def da_limit(delta_star: float) -> float:
+    return -math.log(1.0 - delta_star)
+
+
+def q_min(p: Params, delta_star: float, T=None) -> float:
+    """Минимальный расход, м³/с: Da_эф(Q) ≤ -ln(1-δ*), с учётом k_v."""
+    ke = float(k_eff(p.ks(T), p.R, p.D))
+    return (2.0 * math.pi * p.R * p.L * ke + math.pi * p.R ** 2 * p.L * p.k_v) / da_limit(delta_star)
+
+
+# ---------------------------------------------------------------------------
+# Раздел 5. Тепловое управление
+# ---------------------------------------------------------------------------
+def e_eff(E, E_D, keff_over_ks):
+    r = np.asarray(keff_over_ks)
+    return r * E + (1.0 - r) * E_D
+
+
+def delta_T_star(delta_star, T_w, E_eff, exact=False):
+    """ΔT* = δ* R T²/E_эф (как в плане). exact=True: -ln(1-δ*) R T²/E_эф
+    (точная обратная к δ = 1 - exp(-E ΔT / R T²))."""
+    f = da_limit(delta_star) if exact else delta_star
+    return f * R_GAS * T_w ** 2 / np.asarray(E_eff)
+
+
+def wall_attenuation(wavelength, delta_w):
+    """Коэффициент ослабления гармонической неоднородности нагревателя стенкой
+    (предел слабой связи с золем)."""
+    return 1.0 / np.cosh(2.0 * np.pi * delta_w / np.asarray(wavelength))
+
+
+def fin_length(p: Params) -> float:
+    """Длина теплового ребра стенки: l_f = sqrt(λ_w δ_w / h)."""
+    return math.sqrt(p.lam_wall * p.delta_w / p.h_loss)
+
+
+def end_zone_length(p: Params, dT_end: float, dT_star: float) -> float:
+    """Протяжённость торцевой зоны, где отклонение T_w > ΔT*,
+    при экспоненциальном затухании торцевого провала dT_end."""
+    if dT_end <= dT_star:
+        return 0.0
+    return fin_length(p) * math.log(dT_end / dT_star)
+
+
+def selectivity(E, dT, T):
+    """Ускорение роста в перегретом пятне: (линеаризованное, точное)."""
+    lin = math.exp(E * dT / (R_GAS * T ** 2))
+    ex = math.exp(E / R_GAS * (1.0 / T - 1.0 / (T + dT)))
+    return lin, ex
+
+
+# ---------------------------------------------------------------------------
+# Раздел 6. Статика и сужение
+# ---------------------------------------------------------------------------
+def m_max(c0, R):
+    return c0 * M_SIO2 * R / 2.0
+
+
+def static_modes(Bi: float, n: int = 30):
+    """Корни λ J1(λ) = Bi J0(λ) и веса A_n (доля Si в моде) для закрытого канала."""
+    z0 = jn_zeros(0, n)
+    z1 = np.concatenate([[0.0], jn_zeros(1, max(n - 1, 1))])[:n]
+    lams = []
+    for k in range(n):
+        if math.isinf(Bi):
+            lams.append(z0[k])
+            continue
+        f = lambda x: x * j1(x) - Bi * j0(x)
+        a, b = z1[k] + 1e-12, z0[k] - 1e-12
+        lams.append(brentq(f, a, b, xtol=1e-14))
+    lams = np.array(lams)
+    if math.isinf(Bi):
+        A = 4.0 / lams ** 2
+    else:
+        A = 4.0 * Bi ** 2 / (lams ** 2 * (lams ** 2 + Bi ** 2))
+    return lams, A
+
+
+def static_deposit_fraction(t, p: Params, n_modes: int = 30):
+    """m(t)/m_max для закрытого канала (точный ряд по модам, k_v учитывается)."""
+    lams, A = static_modes(p.Bi, n_modes)
+    rates = lams ** 2 * p.D / p.R ** 2
+    t = np.atleast_1d(np.asarray(t, dtype=float))[:, None]
+    frac = A * rates / (rates + p.k_v) * (1.0 - np.exp(-(rates + p.k_v) * t))
+    return frac.sum(axis=1)
+
+
+def k_eff_static(p: Params) -> float:
+    """k_эф статики по первой моде: 2k_эф/R = λ₁² D/R²."""
+    lam1 = static_modes(p.Bi, 1)[0][0]
+    return lam1 ** 2 * p.D / (2.0 * p.R)
+
+
+def static_first_mode_fraction(Da_st, kappa=0.0):
+    """Формула плана: m/m_max = 1/(1+κ)·[1 - exp(-Da_ст(1+κ))], κ = k_v R/(2k_эф)."""
+    Da_st = np.asarray(Da_st)
+    return (1.0 / (1.0 + kappa)) * (1.0 - np.exp(-Da_st * (1.0 + kappa)))
+
+
+def narrowing_epsilon(f, c0, rho_layer):
+    return f * c0 * M_SIO2 / (2.0 * rho_layer)
+
+
+def n_cycles(R0, Rf, eps):
+    return math.log(R0 / Rf) / (-math.log(1.0 - eps))
+
+
+def dp_poiseuille(Q, R, L, mu):
+    return 8.0 * mu * L * Q / (math.pi * R ** 4)
+
+
+def capillary_bundle_k(phi, r, tau):
+    return phi * r ** 2 / (8.0 * tau)
+
+
+def r_for_permeability(k, phi, tau):
+    return math.sqrt(8.0 * tau * k / phi)
+
+
+def kozeny_carman(d, phi):
+    return d ** 2 * phi ** 3 / (180.0 * (1.0 - phi) ** 2)
+
+
+# ---------------------------------------------------------------------------
+# Раздел 7. Численная проверка
+# ---------------------------------------------------------------------------
+def march_solution(Bi: float, zeta_end: float, N: int = 200, Da_v: float = 0.0,
+                   n_out: int = 400, zeta_min: float = 1e-5):
+    """Стационарная задача u*(η) ∂c/∂ζ = (1/η)∂(η∂c/∂η) - Da_v c,
+    c(0,η)=1, ∂c/∂η(0)=0, -∂c/∂η(1) = Bi c(1).
+    Конечные объёмы по η, интегрирование по ζ (BDF).
+    Дополнительные состояния: W = ∫j dζ (сток на стенку), V = ∫Da_v ∫cη dη dζ.
+    Возвращает ζ, c̄ (среднерасходная), c_w, j (поток на стенку), баланс."""
+    dr = 1.0 / N
+    eta = (np.arange(N) + 0.5) * dr
+    eta_f = np.arange(N + 1) * dr
+    u = 2.0 * (1.0 - eta ** 2)
+    wvol = eta * dr                               # вес ∫·η dη
+    if math.isinf(Bi):
+        wall_coef = 2.0 / dr                      # c_w = 0, поток = c_N/(dr/2)
+    else:
+        wall_coef = Bi / (1.0 + Bi * dr / 2.0)    # j = Bi c_w, c_w = c_N/(1+Bi dr/2)
+
+    rows, cols, vals = [], [], []
+    for i in range(N):
+        diag = -Da_v * wvol[i]
+        if i > 0:
+            g = eta_f[i] / dr
+            rows += [i]; cols += [i - 1]; vals += [g]; diag -= g
+        if i < N - 1:
+            g = eta_f[i + 1] / dr
+            rows += [i]; cols += [i + 1]; vals += [g]; diag -= g
+        else:
+            diag -= eta_f[N] * wall_coef
+        rows += [i]; cols += [i]; vals += [diag]
+    A = sparse.csr_matrix((vals, (rows, cols)), shape=(N, N))
+    Minv = sparse.diags(1.0 / (u * wvol))
+    A = Minv @ A
+    # строки накопителей W и V
+    wW = np.zeros(N); wW[-1] = wall_coef
+    wV = Da_v * wvol
+    big = sparse.bmat([[A, sparse.csr_matrix((N, 2))],
+                       [sparse.csr_matrix(np.vstack([wW, wV])), sparse.csr_matrix((2, 2))]],
+                      format="csr")
+    y0 = np.concatenate([np.ones(N), [0.0, 0.0]])
+    t_eval = np.unique(np.concatenate([[0.0], np.geomspace(zeta_min, zeta_end, n_out)]))
+    sol = solve_ivp(lambda z, y: big @ y, (0.0, zeta_end), y0, method="BDF",
+                    jac=big, t_eval=t_eval, rtol=1e-8, atol=1e-12)
+    c = sol.y[:N]
+    flux_w = u * wvol                                  # ∫u c η dη
+    cb = (flux_w @ c) / flux_w.sum()
+    cw = c[-1] * (0.0 if math.isinf(Bi) else 1.0 / (1.0 + Bi * dr / 2.0))
+    j = wall_coef * c[-1]
+    conv_in = flux_w.sum()
+    conv_out = flux_w @ c
+    W, V = sol.y[N], sol.y[N + 1]
+    balance = (conv_in - conv_out - W - V) / conv_in
+    return {"zeta": sol.t, "cb": cb, "cw": cw, "j": j, "balance": balance,
+            "c_profile": c, "eta": eta}
+
+
+def leveque_sh(zeta, shah=False):
+    """Локальное Sh_D Левека: 1,077 x*^(-1/3), x* = z/(d·Pe_d) = ζ/4.
+    shah=True — с поправкой Шаха: 1,077 x*^(-1/3) − 0,7 (x* ≤ 0,01)."""
+    x = np.asarray(zeta) / 4.0
+    return 1.077 * x ** (-1.0 / 3.0) - (0.7 if shah else 0.0)
+
+
+def thermal_fill_check(p: Params, T0=293.15, Th=None, N_sol=60, N_wall=120, t_end=30.0):
+    """Квазиизотермичность: порция холодного золя (T0) в канале, стенка
+    предварительно прогрета до Th, внешняя граница стенки держится при Th.
+    Радиальная сопряжённая теплопроводность (конечные объёмы)."""
+    Th = p.T_w if Th is None else Th
+    R, dw = p.R, p.delta_w
+    r_f = np.concatenate([np.linspace(0, R, N_sol + 1), np.linspace(R, R + dw, N_wall + 1)[1:]])
+    rc = 0.5 * (r_f[1:] + r_f[:-1])
+    dr = np.diff(r_f)
+    n = len(rc)
+    lam = np.where(rc < R, p.lam_sol, p.lam_wall)
+    rhoc = np.where(rc < R, p.rhoc_sol, p.rhoc_wall)
+    vol = rc * dr
+    # проводимости граней (гармоническое среднее)
+    G = np.zeros(n + 1)
+    for k in range(1, n):
+        res = (rc[k] - r_f[k]) / lam[k] + (r_f[k] - rc[k - 1]) / lam[k - 1]
+        G[k] = r_f[k] / res
+    G[n] = r_f[n] / ((r_f[n] - rc[-1]) / lam[-1])  # внешняя граница, T = Th
+    rows, cols, vals = [], [], []
+    for k in range(n):
+        d = 0.0
+        if k > 0:
+            rows.append(k); cols.append(k - 1); vals.append(G[k]); d -= G[k]
+        if k < n - 1:
+            rows.append(k); cols.append(k + 1); vals.append(G[k + 1]); d -= G[k + 1]
+        else:
+            d -= G[n]
+        rows.append(k); cols.append(k); vals.append(d)
+    A = sparse.diags(1.0 / (rhoc * vol)) @ sparse.csr_matrix((vals, (rows, cols)), shape=(n, n))
+    b = np.zeros(n); b[-1] = G[n] * Th / (rhoc[-1] * vol[-1])
+    y0 = np.where(rc < R, T0, Th)
+    t_eval = np.concatenate([[0.0], np.geomspace(1e-3, t_end, 300)])
+    sol = solve_ivp(lambda t, y: A @ y + b, (0, t_end), y0, method="BDF", jac=A,
+                    t_eval=t_eval, rtol=1e-8, atol=1e-8)
+    i_wall = np.searchsorted(rc, R)               # первая ячейка стенки
+    T_center = sol.y[0]
+    T_inner_wall = sol.y[i_wall]
+    dev = np.abs(Th - sol.y[:i_wall]).max(axis=0)
+    return {"t": sol.t, "T_center": T_center, "T_inner_wall": T_inner_wall,
+            "max_dev_sol": dev}
+
+
+def moving_boundary(p: Params, mode: str, R0: float, Da0: float, R_stop_frac=0.4,
+                    Nz=300, snapshots=(1.0, 0.8, 0.6, 0.4), t_max=1e7):
+    """Квазистационарное сужение R(z,t):
+        dR/dt = -(M/ρ_сл) k_эф(R) c̄(z,t),
+        dc̄/dz = -(2 k_эф/(R ū) + k_v/ū) c̄,  ū = Q/(πR²).
+    mode = 'Q' (Q = const) или 'dp' (Δp = const). Начальный расход задаётся
+    так, чтобы Da_эф(t=0) = Da0. Возвращает профили R(z) в моменты, когда
+    min R/R0 достигает значений snapshots."""
+    z = np.linspace(0.0, p.L, Nz)
+    dz = z[1] - z[0]
+    R = np.full(Nz, R0)
+    ke0 = float(k_eff(p.ks(), R0, p.D))
+    Q0 = 2.0 * math.pi * R0 * p.L * ke0 / Da0
+    dp0 = dp_poiseuille(Q0, R0, p.L, p.mu)
+    t = 0.0
+    snaps = {}
+    targets = sorted(snapshots, reverse=True)
+    history = []
+    c0 = p.c0
+    while True:
+        if mode == "Q":
+            Q = Q0
+        else:
+            resist = 8.0 * p.mu / math.pi * np.trapezoid(1.0 / R ** 4, z)
+            Q = dp0 / resist
+        u = Q / (math.pi * R ** 2)
+        ke = k_eff(p.ks(), R, p.D)
+        rate = 2.0 * ke / (R * u) + p.k_v / u
+        # интеграл от 0 до z (трапеции)
+        integ = np.concatenate([[0.0], np.cumsum(0.5 * (rate[1:] + rate[:-1]) * dz)])
+        cb = c0 * np.exp(-integ)
+        dRdt = -(M_SIO2 / p.rho_layer) * ke * cb
+        frac = R.min() / R0
+        history.append((t, frac, (R.max() - R.min()) / R0, Q / Q0))
+        while targets and frac <= targets[0] + 1e-12:
+            snaps[targets.pop(0)] = (t, R.copy(), Q / Q0, float(ke[-1] * cb[-1] / (ke[0] * cb[0])))
+        if frac <= R_stop_frac or t > t_max or not targets:
+            break
+        dt = 0.002 * R.min() / np.abs(dRdt).max()
+        R = R + dRdt * dt
+        t += dt
+    return {"z": z, "snaps": snaps, "history": np.array(history), "Q0": Q0, "dp0": dp0}
+
+
+# ---------------------------------------------------------------------------
+# Отчёт
+# ---------------------------------------------------------------------------
+class Report:
+    def __init__(self):
+        self.lines = []
+        self.data = {}
+
+    def h(self, title):
+        self.p("")
+        self.p("=" * 78)
+        self.p(title)
+        self.p("=" * 78)
+
+    def p(self, s=""):
+        print(s)
+        self.lines.append(s)
+
+    def table(self, header, rows, fmt=None):
+        w = [max(len(str(x)) for x in col) for col in zip(header, *rows)]
+        line = "  ".join(str(x).ljust(k) for x, k in zip(header, w))
+        self.p(line)
+        self.p("  ".join("-" * k for k in w))
+        for r in rows:
+            self.p("  ".join(str(x).ljust(k) for x, k in zip(r, w)))
+
+
+def fmt(x, n=3):
+    if x == 0 or not np.isfinite(x):
+        return str(x)
+    e = math.floor(math.log10(abs(x)))
+    if -2 <= e <= 4:
+        return f"{x:.{max(n - 1 - e, 0)}f}"
+    return f"{x:.{n - 1}e}"
+
+
+def write_csv(path, header, rows):
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(header)
+        w.writerows(rows)
+
+
+# ---------------------------------------------------------------------------
+# Рисунки
+# ---------------------------------------------------------------------------
+C = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100"]   # фиксированный порядок серий
+INK, INK2, GRID = "#1f1f1e", "#5c5b55", "#e3e2dc"
+
+
+def _style():
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    plt.rcParams.update({
+        "font.size": 9, "axes.titlesize": 9, "axes.labelsize": 9,
+        "legend.fontsize": 8, "xtick.labelsize": 8, "ytick.labelsize": 8,
+        "axes.spines.top": False, "axes.spines.right": False,
+        "axes.edgecolor": INK2, "axes.labelcolor": INK, "xtick.color": INK2,
+        "ytick.color": INK2, "text.color": INK, "axes.grid": True,
+        "grid.color": GRID, "grid.linewidth": 0.6, "lines.linewidth": 1.6,
+        "legend.frameon": False, "savefig.dpi": 300, "figure.dpi": 110,
+        "mathtext.default": "regular",
+    })
+    return plt
+
+
+def _save(fig, outdir, name):
+    os.makedirs(outdir, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(os.path.join(outdir, name + ".png"), bbox_inches="tight")
+    fig.savefig(os.path.join(outdir, name + ".pdf"), bbox_inches="tight")
+
+
+def fig2_times(p, outdir):
+    plt = _style()
+    fig, ax = plt.subplots(figsize=(3.8, 2.7))
+    labels = ["Прогрев золя, R²/a", "Прогрев стенки, δ$_w$²/a$_w$",
+              "Радиальная диффузия, R²/D", "Пребывание, L/ū", "Гелеобразование\n(лит., иллюстр.)"]
+    ypos = np.arange(5)[::-1]
+    for k, (R, mk) in enumerate(((250e-6, "o"), (500e-6, "s"))):
+        ts = time_scales(replace(p, R=R))
+        y = ypos + (0.14 if k == 0 else -0.14)
+        pts = [ts["t_heat_sol"], ts["t_heat_wall"], ts["t_diff_radial"]]
+        ax.plot(pts, y[:3], mk, color=C[k], ms=6, label=f"R = {R*1e6:.0f} мкм",
+                mec="white", mew=0.8)
+        ax.plot([ts["t_res_min"], ts["t_res_max"]], [y[3]] * 2, "-", color=C[k], lw=2)
+        ax.plot([ts["t_res_min"], ts["t_res_max"]], [y[3]] * 2, mk, color=C[k], ms=5,
+                mec="white", mew=0.8)
+    ax.fill_between([3600, 10 * 3600], -0.3, 0.3, color=INK2, alpha=0.25, lw=0)
+    for t, s_ in ((60, "1 мин"), (3600, "1 ч")):
+        ax.axvline(t, color=INK2, lw=0.6, ls=":")
+        ax.text(t * 1.15, 4.35, s_, color=INK2, fontsize=7)
+    ax.set_xscale("log")
+    ax.set_yticks(ypos, labels)
+    ax.set_ylim(-0.6, 4.6)
+    ax.set_xlabel("Характерное время, с")
+    ax.set_xlim(0.2, 1e5)
+    ax.legend(loc="lower left", bbox_to_anchor=(0.0, 1.0), ncol=2, fontsize=7,
+              handletextpad=0.3, borderaxespad=0.2)
+    ax.grid(axis="y", visible=False)
+    _save(fig, outdir, "fig2_times")
+    plt.close(fig)
+
+
+def fig3_profiles(p, outdir, N):
+    plt = _style()
+    fig, axs = plt.subplots(1, 2, figsize=(7.0, 2.6), sharex=True)
+    ks = float(p.ks())
+    Bi = p.Bi
+    for k, Qul in enumerate((0.1, 0.3, 1.0, 2.0)):
+        pp = replace(p, Q_ul_min=Qul)
+        zeta_L = p.L * p.D / (pp.u_mean * p.R ** 2)
+        res = march_solution(Bi, zeta_L, N=N, n_out=300, zeta_min=zeta_L * 1e-4)
+        zmm = res["zeta"] * pp.u_mean * p.R ** 2 / p.D * 1e3
+        ke = float(k_eff(ks, p.R, p.D))
+        an = np.exp(-2.0 * ke * zmm * 1e-3 / (p.R * pp.u_mean))
+        axs[0].plot(zmm, res["cb"], color=C[k], label=f"Q = {Qul:g} мкл/мин")
+        axs[0].plot(zmm, an, color=INK, lw=0.9, ls="--")
+        Jnum = res["j"] * p.D / p.R            # м/с · c0
+        axs[1].plot(zmm, Jnum / (ke), color=C[k])
+        axs[1].plot(zmm, an, color=INK, lw=0.9, ls="--")
+    axs[0].set_ylabel("c̄ / c₀")
+    axs[1].set_ylabel("J / (k$_{эф}$ c₀)")
+    for ax in axs:
+        ax.set_xlabel("z, мм")
+        ax.set_ylim(0, 1.05)
+    axs[0].plot([], [], color=INK, lw=0.9, ls="--", label="аналитика")
+    axs[0].legend(loc="lower left", fontsize=7)
+    axs[0].set_title(f"R = {p.R*1e6:.0f} мкм, Bi = {Bi:.3g}", loc="left")
+    _save(fig, outdir, "fig3_profiles")
+    plt.close(fig)
+
+
+def fig4_delta(outdir):
+    plt = _style()
+    fig, ax = plt.subplots(figsize=(3.4, 2.5))
+    Da = np.linspace(0, 1.5, 300)
+    ax.plot(Da, 100 * nonuniformity(Da), color=C[0])
+    for ds, ls in ((0.2, "-"), (0.1, "--")):
+        dl = da_limit(ds)
+        ax.plot([0, dl, dl], [100 * ds, 100 * ds, 0], color=INK2, lw=0.9, ls=ls)
+        ax.text(0.27, 100 * ds - 6, f"δ* = {ds*100:.0f} %:  Da$_{{эф}}$ ≤ {dl:.3f}",
+                fontsize=7, color=INK2)
+    ax.plot([1.27], [100 * (1 - math.exp(-1.27))], "o", color=C[1], ms=6, mec="white")
+    ax.text(1.27, 100 * (1 - math.exp(-1.27)) - 22, "прежний\nпорог 1,27\n(δ ≈ 72 %)",
+            fontsize=7, ha="center", color=INK2)
+    ax.set_xlabel("Da$_{эф}$")
+    ax.set_ylabel("δ, %")
+    ax.set_xlim(0, 1.5); ax.set_ylim(0, 80)
+    _save(fig, outdir, "fig4_delta_vs_Da")
+    plt.close(fig)
+
+
+def fig5_qmin(p, outdir):
+    plt = _style()
+    fig, ax = plt.subplots(figsize=(3.4, 2.6))
+    T = np.linspace(313.15, 353.15, 81)
+    for k, R in enumerate((250e-6, 500e-6)):
+        pp = replace(p, R=R)
+        for ds, ls in ((0.2, "-"), (0.1, "--")):
+            q = [q_min(pp, ds, Tk) / UL_MIN for Tk in T]
+            ax.plot(T - 273.15, q, color=C[k], ls=ls,
+                    label=f"R = {R*1e6:.0f} мкм" if ds == 0.2 else None)
+    ax.axhspan(0.1, 2.0, color=INK2, alpha=0.12, lw=0)
+    ax.text(41, 0.13, "рабочий диапазон Q", fontsize=7, color=INK2)
+    ax.set_yscale("log")
+    ax.set_xlabel("T$_w$, °C")
+    ax.set_ylabel("Q$_{min}$, мкл/мин")
+    ax.plot([], [], color=INK2, ls="--", label="δ* = 10 %")
+    ax.legend(loc="upper left", fontsize=7)
+    ax.set_title(f"E = {p.E/1e3:.0f} кДж/моль, k$_s$({p.T_ref-273.15:.0f} °C) = {p.ks_ref:.0e} м/с (иллюстр.)",
+                 loc="left", fontsize=7)
+    _save(fig, outdir, "fig5_Qmin_vs_Tw")
+    plt.close(fig)
+
+
+def fig6_dTstar(p, outdir):
+    plt = _style()
+    fig, ax = plt.subplots(figsize=(3.4, 2.6))
+    r = np.linspace(0.02, 1.0, 200)
+    for k, E in enumerate((40e3, 60e3, 80e3)):
+        ax.plot(r, delta_T_star(0.2, p.T_w, e_eff(E, p.E_D, r)), color=C[k],
+                label=f"E = {E/1e3:.0f} кДж/моль")
+    ax.set_ylim(0, None)
+    ax.set_xlabel("k$_{эф}$ / k$_s$   (← диффузионный · кинетический →)")
+    ax.set_ylabel("ΔT*, K")
+    ax.legend(loc="upper right", fontsize=7)
+    ax.set_title(f"δ* = 20 %, T$_w$ = {p.T_w-273.15:.0f} °C, E$_D$ = {p.E_D/1e3:.0f} кДж/моль",
+                 loc="left", fontsize=7)
+    _save(fig, outdir, "fig6_dTstar")
+    plt.close(fig)
+
+
+def fig7_static(p, mb, outdir):
+    plt = _style()
+    fig, axs = plt.subplots(1, 3, figsize=(7.2, 2.5))
+    Da = np.geomspace(1e-2, 1e2, 200)
+    for k, kap in enumerate((0.0, 0.5, 2.0)):
+        axs[0].plot(Da, static_first_mode_fraction(Da, kap), color=C[k], label=f"κ = {kap:g}")
+    axs[0].set_xscale("log")
+    axs[0].set_xlabel("Da$_{ст}$")
+    axs[0].set_ylabel("m / m$_{max}$")
+    axs[0].legend(fontsize=7, title="κ = k$_v$R/(2k$_{эф}$)", title_fontsize=7)
+    n = np.arange(0, 301)
+    for k, f in enumerate((1.0, 0.5, 0.25)):
+        eps = narrowing_epsilon(f, p.c0, p.rho_layer)
+        axs[1].plot(n, (1 - eps) ** n, color=C[k], label=f"f = {f:g}")
+    axs[1].set_yscale("log")
+    axs[1].set_xlabel("число циклов n")
+    axs[1].set_ylabel("R$_n$ / R₀")
+    axs[1].legend(fontsize=7)
+    for k, (mode, res) in enumerate(mb.items()):
+        ls = "-" if mode == "Q" else "--"
+        for frac, (t, R, qr, jr) in sorted(res["snaps"].items(), reverse=True):
+            if frac in (1.0,):
+                continue
+            axs[2].plot(res["z"] * 1e3, R / res_R0(res), color=C[k], ls=ls, lw=1.2)
+        axs[2].plot([], [], color=C[k], ls=ls, label="Q = const" if mode == "Q" else "Δp = const")
+    axs[2].set_xlabel("z, мм")
+    axs[2].set_ylabel("R / R₀")
+    axs[2].legend(fontsize=7, loc="lower right")
+    _save(fig, outdir, "fig7_static_narrowing")
+    plt.close(fig)
+
+
+def res_R0(res):
+    return res["snaps"][1.0][1][0]
+
+
+def figS_checks(sh_rows, lev, outdir):
+    plt = _style()
+    fig, axs = plt.subplots(1, 2, figsize=(7.0, 2.5))
+    Bi = np.array([r[0] for r in sh_rows]); Sh = np.array([r[1] for r in sh_rows])
+    axs[0].plot(Bi, Sh, color=C[0], label="точное (Гретц, 3-й род)")
+    axs[0].axhline(SH_NEUMANN, color=INK2, ls=":", lw=0.9)
+    axs[0].axhline(SH_DIRICHLET, color=INK2, ls=":", lw=0.9)
+    axs[0].text(1.2e-4, SH_NEUMANN - 0.09, "4,364", fontsize=7, color=INK2)
+    axs[0].text(2e3, SH_DIRICHLET + 0.03, "3,657", fontsize=7, color=INK2)
+    axs[0].set_xscale("log"); axs[0].set_xlabel("Bi = k$_s$R/D"); axs[0].set_ylabel("Sh (по диаметру)")
+    z, shn = lev
+    axs[1].plot(z, shn, color=C[0], label="численно, стенка-сток")
+    axs[1].plot(z, leveque_sh(z), color=C[1], ls="--", label="Левек 1,077 x*$^{-1/3}$")
+    axs[1].plot(z, leveque_sh(z, shah=True), color=C[2], ls=":", label="то же − 0,7 (Шах)")
+    axs[1].axhline(SH_DIRICHLET, color=INK2, ls=":", lw=0.9)
+    axs[1].set_xscale("log"); axs[1].set_yscale("log")
+    axs[1].set_xlabel("ζ = zD/(ūR²)"); axs[1].set_ylabel("Sh локальное")
+    axs[1].legend(fontsize=7)
+    _save(fig, outdir, "figS_checks_Sh_Leveque")
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# Основной сценарий
+# ---------------------------------------------------------------------------
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
+    ap.add_argument("--out", default="results")
+    ap.add_argument("--quick", action="store_true")
+    ap.add_argument("--no-figs", action="store_true")
+    args = ap.parse_args(argv)
+    out = args.out
+    figdir = os.path.join(out, "figures")
+    os.makedirs(out, exist_ok=True)
+    N = 120 if args.quick else 300
+
+    p = Params()
+    rep = Report()
+    rep.p("Расчёт к статье: золь-гель осаждение SiO₂ в фотополимерном микроканале")
+    rep.p("ВНИМАНИЕ: k_s, E, E_D, t_gel — иллюстративные значения (см. Params).")
+
+    # ---------------- параметры ----------------
+    rep.h("Параметры")
+    c0 = p.c0
+    rep.p(f"c0 (Si) из мольных объёмов = {c0/1e3:.3f} моль/л")
+    rep.p(f"a_золя = {p.a_sol:.2e} м²/с, a_стенки = {p.a_wall:.2e} м²/с, ν = {p.nu:.2e} м²/с")
+    rep.p(f"k_s(T_w) = {float(p.ks()):.2e} м/с, E = {p.E/1e3:.0f} кДж/моль, D = {p.D:.1e} м²/с")
+    rep.data["c0_mol_L"] = c0 / 1e3
+
+    # ---------------- раздел 3 ----------------
+    rep.h("3. Иерархия характерных времён (L = 25 мм, Q = 0,1…2 мкл/мин)")
+    rows = []
+    for R in (250e-6, 500e-6):
+        ts = time_scales(replace(p, R=R))
+        rows.append([f"{R*1e6:.0f}", fmt(ts["t_heat_sol"]), fmt(ts["t_heat_wall"]),
+                     fmt(ts["t_diff_radial"]), f"{ts['t_res_min']:.0f}–{ts['t_res_max']:.0f}",
+                     f"{ts['t_gel']/3600:.1f} ч*"])
+        rep.data[f"times_R{R*1e6:.0f}"] = ts
+    rep.table(["R, мкм", "R²/a, с", "δw²/aw, с", "R²/D, с", "L/ū, с", "t_gel"], rows)
+    write_csv(os.path.join(out, "times.csv"),
+              ["R_um", "t_heat_sol", "t_heat_wall", "t_diff", "t_res_min", "t_res_max"],
+              [[r[0], *r[1:5]] for r in rows])
+
+    rep.p("")
+    rows = []
+    for R in (250e-6, 500e-6):
+        for Qul in (0.1, 2.0):
+            pp = replace(p, R=R, Q_ul_min=Qul)
+            rows.append([f"{R*1e6:.0f}", f"{Qul:g}", fmt(pp.u_mean * 1e6), fmt(thermal_peclet(pp)),
+                         fmt(entry_length(pp.Q, p.D) * 1e3),
+                         fmt(100 * entry_length(pp.Q, p.D) / p.L)])
+    rep.table(["R, мкм", "Q, мкл/мин", "ū, мкм/с", "Pe_T = ūR/a", "L_e, мм", "L_e/L, %"], rows)
+
+    rep.p("")
+    rep.p("Естественная конвекция в горизонтальном канале от осевого градиента T_w")
+    rep.p("(течение Бириха, u_max = gβG(2R)³/(72√3ν)):")
+    rows = []
+    lf = fin_length(p)
+    grads = (("ΔT*=3 K на L", 3.0 / p.L), ("торец 5 K на l_f", 5.0 / lf))
+    nc_rows = []
+    for R in (250e-6, 500e-6):
+        pp = replace(p, R=R)
+        for name, G_ in grads:
+            u_nc = natural_convection_velocity(pp, G_)
+            u01 = replace(pp, Q_ul_min=0.1).u_mean
+            rows.append([f"{R*1e6:.0f}", name, fmt(G_), fmt(u_nc * 1e6), fmt(p.D / R * 1e6),
+                         fmt(u01 * 1e6), fmt(u_nc / u01)])
+            nc_rows.append([R, G_, u_nc, p.D / R, u01])
+    rep.table(["R, мкм", "градиент", "G, К/м", "u_ест, мкм/с", "D/R, мкм/с",
+               "ū(0,1), мкм/с", "u_ест/ū"], rows)
+    rep.p("Замечание: u_ест ∝ R³. При R = 500 мкм и малом расходе конвекция от осевого")
+    rep.p("градиента сравнима с вынужденным потоком; в статике (ū = 0) она — единственное")
+    rep.p("течение. Утверждение 3 плана требует этой оценки с реальным G и ориентацией канала.")
+    rep.data["natural_convection"] = nc_rows
+
+    # ---------------- раздел 4 ----------------
+    rep.h("4. Проточный режим: задача Гретца с условием 3-го рода")
+    sh_rows = []
+    for Bi in np.geomspace(1e-4, 1e4, 33):
+        m = graetz_first_mode(float(Bi))
+        series = 1.0 / (1.0 + 2.0 * Bi / m["Sh_D"])
+        sh_rows.append([float(Bi), m["Sh_D"], m["keff_over_ks"], series, m["beta1"]])
+    md = graetz_first_mode(math.inf)
+    rep.p(f"Bi → ∞ (стенка-сток): β₁ = {md['beta1']:.4f}, Sh_D = {md['Sh_D']:.4f}  (эталон 3,6568)")
+    m0 = graetz_first_mode(1e-6)
+    rep.p(f"Bi → 0 (кинетика):     Sh_D = {m0['Sh_D']:.4f}  (эталон 4,3636)")
+    rep.p("Проверка тождества β₁ = 2 k_эф R / D: " +
+          ", ".join(f"Bi={r[0]:.0e}: {r[4]/(2*r[2]*r[0]):.6f}" for r in sh_rows[::8] if r[2] > 0))
+    write_csv(os.path.join(out, "sherwood_vs_Bi.csv"),
+              ["Bi", "Sh_D", "keff_over_ks_exact", "keff_over_ks_series", "beta1"], sh_rows)
+    rep.p("")
+    rows = []
+    for R in (250e-6, 500e-6):
+        pp = replace(p, R=R)
+        ks = float(pp.ks())
+        ke = float(k_eff(ks, R, p.D))
+        rows.append([f"{R*1e6:.0f}", fmt(pp.Bi), fmt(float(sh_of_bi(pp.Bi))), fmt(ke / ks),
+                     fmt(da_eff(replace(pp, Q_ul_min=1.0))),
+                     fmt(q_min(pp, 0.2) / UL_MIN), fmt(q_min(pp, 0.1) / UL_MIN),
+                     fmt(q_min(pp, 0.1) / q_min(pp, 0.2))])
+    rep.table(["R, мкм", "Bi", "Sh_D", "k_эф/k_s", "Da_эф(1 мкл/мин)", "Q_min(20%)",
+               "Q_min(10%)", "отношение"], rows)
+    rep.p(f"Пороги: δ*=20 % → Da ≤ {da_limit(0.2):.4f}; δ*=10 % → Da ≤ {da_limit(0.1):.4f}; "
+          f"прежний Da=1,27 → δ = {100*(1-math.exp(-1.27)):.1f} %")
+    rep.data["Qmin_ul_min"] = {r[0]: {"20%": r[5], "10%": r[6]} for r in rows}
+
+    # ---------------- раздел 5 ----------------
+    rep.h("5. Тепловое управление: ΔT*")
+    rows = []
+    for E in (40e3, 60e3, 80e3):
+        rows.append([f"{E/1e3:.0f}", fmt(float(delta_T_star(0.2, p.T_w, E))),
+                     fmt(float(delta_T_star(0.1, p.T_w, E))),
+                     fmt(float(delta_T_star(0.2, p.T_w, E, exact=True))),
+                     fmt(float(delta_T_star(0.1, p.T_w, E, exact=True)))])
+    rep.table(["E, кДж/моль", "ΔT*(20%), K", "ΔT*(10%), K", "точн.(20%)", "точн.(10%)"], rows)
+    rep.p("«точн.» — с -ln(1-δ*) вместо δ*: при 20 % отличие ≈ 12 %.")
+    rep.p("")
+    pp = replace(p)
+    ks = float(pp.ks()); ke = float(k_eff(ks, pp.R, pp.D))
+    Ee = float(e_eff(pp.E, pp.E_D, ke / ks))
+    rep.p(f"Текущий режим R={pp.R*1e6:.0f} мкм: k_эф/k_s = {ke/ks:.4f}, E_эф = {Ee/1e3:.1f} кДж/моль, "
+          f"ΔT*(20 %) = {float(delta_T_star(0.2, pp.T_w, Ee)):.2f} K")
+    rep.p("")
+    rep.p(f"Ослабление стенкой δ_w = {p.delta_w*1e3:.1f} мм: " +
+          ", ".join(f"λ={lw*1e3:g} мм → {float(wall_attenuation(lw, p.delta_w)):.3f}"
+                    for lw in (2e-3, 5e-3, 10e-3, 25e-3)))
+    lf = fin_length(p)
+    rep.p(f"Длина теплового ребра l_f = sqrt(λ_w δ_w/h) = {lf*1e3:.1f} мм (h = {p.h_loss} Вт/м²К, оценка)")
+    for dTe in (2.0, 5.0, 10.0):
+        rep.p(f"  торцевой провал {dTe:g} K → зона с |ΔT| > ΔT*(20 %, E=60) длиной "
+              f"{end_zone_length(p, dTe, float(delta_T_star(0.2, p.T_w, 60e3)))*1e3:.1f} мм")
+    rep.p("")
+    for dT in (10.0, 20.0):
+        lin, ex = selectivity(60e3, dT, p.T_w)
+        rep.p(f"Избирательность локального нагрева, E = 60, ΔT = {dT:g} K: "
+              f"линеаризованная {lin:.2f}, точная {ex:.2f}")
+
+    # ---------------- раздел 6 ----------------
+    rep.h("6. Статический режим и сужение")
+    rows = []
+    for R in (250e-6, 500e-6):
+        mm = m_max(c0, R)
+        rows.append([f"{R*1e6:.0f}", fmt(mm * 1e3), fmt(mm / p.rho_layer * 1e6)])
+    rep.table(["R, мкм", "m_max, г/м²", "h_экв, мкм"], rows)
+    rep.p("")
+    pp = replace(p)
+    kst = k_eff_static(pp)
+    Dast = 2 * kst * pp.t_gel / pp.R
+    fr = float(static_deposit_fraction(pp.t_gel, pp)[0])
+    rep.p(f"R=250 мкм: k_эф(статика, 1-я мода) = {kst:.3e} м/с, Da_ст = {Dast:.3f}, "
+          f"m(t_gel)/m_max = {fr:.3f} (ряд), {float(static_first_mode_fraction(Dast)):.3f} (1-я мода)")
+    lam, A = static_modes(pp.Bi, 30)
+    rep.p(f"Сумма весов мод = {A.sum():.6f} (должна быть 1)")
+    rep.p("")
+    eps1 = narrowing_epsilon(1.0, c0, p.rho_layer)
+    rep.p(f"ε (f=1) = {eps1:.4f};  циклов 50 → 0,5 мкм: f=1: {n_cycles(50, 0.5, eps1):.0f}, "
+          f"f=0,5: {n_cycles(50, 0.5, narrowing_epsilon(0.5, c0, p.rho_layer)):.0f}")
+    rows = []
+    for r in (50e-6, 5e-6, 1e-6, 0.5e-6):
+        rows.append([fmt(r * 1e6), fmt(dp_poiseuille(0.1 * UL_MIN, r, 25e-3, p.mu) / 1e5),
+                     fmt(dp_poiseuille(0.1 * UL_MIN, r, 0.5e-3, p.mu) / 1e5)])
+    rep.p("Перепад давления при Q = 0,1 мкл/мин, μ = 1 мПа·с:")
+    rep.table(["R, мкм", "Δp канал 25 мм, бар", "Δp пережим 0,5 мм, бар"], rows)
+    ratio = (0.5e-3 / (0.5e-6) ** 4) / (24.5e-3 / (50e-6) ** 4)
+    rep.p(f"Сопротивление пережима (0,5 мм, 0,5 мкм) / остального канала (24,5 мм, 50 мкм) = {ratio:.2e}")
+    rq = r_for_permeability(1e-15, 0.1, 2.0)
+    kkc = kozeny_carman(100e-9, 0.4)
+    rep.p(f"Пучок капилляров: k = 1e-15 м² при φ=0,1, τ=2 → r = {rq*1e6:.2f} мкм")
+    rep.p(f"Козени — Кармен, d=100 нм, φ=0,4: k = {kkc:.2e} м² = {kkc/DARCY*1e6:.1f} мкД")
+
+    # ---------------- раздел 7 ----------------
+    rep.h("7. Численная проверка")
+    # (1) Левек
+    zeta_end = 0.5
+    rD = march_solution(math.inf, zeta_end, N=max(N, 400) if not args.quick else 200,
+                        n_out=300, zeta_min=1e-4)
+    sh_loc = 2 * rD["j"][1:] / (rD["cb"][1:] - 0.0)
+    zz = rD["zeta"][1:]
+    sel = (zz > 2e-3) & (zz < 1e-2)
+    err_lev = np.max(np.abs(sh_loc[sel] / leveque_sh(zz[sel]) - 1))
+    err_shah = np.max(np.abs(sh_loc[sel] / leveque_sh(zz[sel], shah=True) - 1))
+    rep.p(f"(1) Вход, ζ ∈ [0,002; 0,01]: max |Sh_числ/Sh − 1| = {100*err_lev:.1f} % (Левек, "
+          f"главный член), {100*err_shah:.2f} % (Левек − Шах, 1,077x*^(-1/3) − 0,7)")
+    rep.p(f"    Sh_числ(ζ = {zz[-1]:.2f}) = {sh_loc[-1]:.4f} (асимптота 3,6568)")
+    lev = (zz, sh_loc)
+    # (2) c̄(z) и J(z)
+    rep.p("(2) Сравнение c̄(z) с аналитикой exp(-2k_эф z/(Rū)) на z > L_e:")
+    rows = []
+    for Bi in (0.01, 0.1, 1.0, 10.0):
+        mode = graetz_first_mode(Bi)
+        for Da_target in (0.223, 1.0):
+            zeta_L = Da_target / mode["beta1"]
+            res = march_solution(Bi, zeta_L, N=N, n_out=200, zeta_min=zeta_L * 1e-4)
+            ze = res["zeta"]
+            an_exact = np.exp(-mode["beta1"] * ze)
+            mask = ze > 0.2              # ζ_e = L_e D/(ū R²) = 0,2
+            err = (fmt(100 * np.max(np.abs(res["cb"][mask] / an_exact[mask] - 1)))
+                   if mask.any() else "L < L_e")
+            delta_num = 1 - res["j"][-1] / res["j"][1]
+            rows.append([f"{Bi:g}", f"{Da_target:g}", err,
+                         fmt(100 * delta_num), fmt(100 * (1 - math.exp(-Da_target))),
+                         fmt(float(np.max(np.abs(res["balance"])))) ])
+    rep.table(["Bi", "Da_эф", "max ош. c̄, % (z>L_e)", "δ числ., %", "δ анал., %",
+               "|баланс|"], rows)
+    rep.p("    δ числ. = 1 − J(L)/J(0⁺); у входа J выше из-за участка Левека.")
+    rep.p("    В рабочем диапазоне ζ_L = πLD/Q = 2,4…47, поэтому Da_эф ≤ 0,223 требует β₁ ≤ 0,09,")
+    rep.p("    т. е. Bi ≲ 0,05: критерий равномерности выполним только в кинетическом режиме,")
+    rep.p("    где входной участок вносит < 1 % (строки Bi = 0,01–0,1).")
+    # (3) квазиизотермичность
+    th = thermal_fill_check(p)
+    rows = []
+    for tt in (0.5, 1, 2, 5, 10, 20):
+        k = np.searchsorted(th["t"], tt)
+        rows.append([fmt(tt), fmt(th["max_dev_sol"][k]), fmt(p.T_w - th["T_inner_wall"][k])])
+    rep.p("(3) Холодный золь (20 °C) заполняет канал с прогретой стенкой (60 °C), R = 250 мкм:")
+    rep.table(["t, с", "max|T_w − T_золь|, K", "провал T внутр. стенки, K"], rows)
+    t01 = th["t"][np.argmax(th["max_dev_sol"] < 0.1)]
+    rep.p(f"    max отклонение < 0,1 K через t ≈ {t01:.1f} с")
+    # (4) сеточная сходимость
+    rep.p("(4) Сеточная сходимость (Bi = 1, Da_эф = 1): c̄(L)")
+    mode = graetz_first_mode(1.0)
+    zl = 1.0 / mode["beta1"]
+    prev = None
+    rows = []
+    for Nn in ((50, 100, 200) if args.quick else (50, 100, 200, 400)):
+        res = march_solution(1.0, zl, N=Nn, n_out=50, zeta_min=zl * 1e-3)
+        val = res["cb"][-1]
+        rows.append([Nn, f"{val:.6f}", "" if prev is None else fmt(abs(val - prev)),
+                     fmt(float(np.max(np.abs(res["balance"]))))])
+        prev = val
+    rep.table(["N", "c̄(L)/c0", "|Δ| к пред.", "|баланс|"], rows)
+    # (5) чувствительность
+    rep.p("(5) Чувствительность Q_min(δ*=20 %) и ΔT*(20 %) к k_s(T_w), E, D (R = 250 мкм):")
+    rows = []
+    sens = []
+    for ksr in (1e-8, 1e-7, 1e-6):
+        for D in (0.5e-9, 1e-9, 2e-9):
+            for E in (40e3, 60e3, 80e3):
+                pp = replace(p, ks_ref=ksr, D=D, E=E)
+                ks = float(pp.ks()); ke = float(k_eff(ks, pp.R, D))
+                qm = q_min(pp, 0.2) / UL_MIN
+                dts = float(delta_T_star(0.2, pp.T_w, e_eff(E, pp.E_D, ke / ks)))
+                sens.append([ksr, D, E / 1e3, qm, dts, ke / ks])
+                if E == 60e3:
+                    rows.append([f"{ksr:.0e}", f"{D:.1e}", fmt(qm), fmt(dts), fmt(ke / ks)])
+    rep.table(["k_s, м/с", "D, м²/с", "Q_min, мкл/мин", "ΔT*(E=60), K", "k_эф/k_s"], rows)
+    write_csv(os.path.join(out, "sensitivity.csv"),
+              ["ks_Tw_m_s", "D_m2_s", "E_kJ_mol", "Qmin_ul_min", "dTstar_K", "keff_over_ks"], sens)
+    # (6) подвижная граница
+    rep.p("(6) Подвижная граница: R0 = 50 мкм, L = 25 мм, Da_эф(0) = 0,5")
+    pmb = replace(p, R=50e-6)
+    mb = {}
+    for mode_ in ("Q", "dp"):
+        mb[mode_] = moving_boundary(pmb, mode_, 50e-6, 0.5, R_stop_frac=0.4,
+                                    Nz=150 if args.quick else 300)
+    rows = []
+    for mode_, res in mb.items():
+        for frac, (t, R, qr, jr) in sorted(res["snaps"].items(), reverse=True):
+            rows.append(["Q=const" if mode_ == "Q" else "Δp=const", fmt(frac), fmt(t / 3600),
+                         fmt((R.max() - R.min()) / R.max()), fmt(R[-1] / R[0]), fmt(qr), fmt(jr)])
+    rep.table(["режим", "min R/R0", "t, ч", "(Rmax−Rmin)/Rmax", "R(L)/R(0)", "Q/Q0",
+               "J(L)/J(0)"], rows)
+    rep.p("    J(L)/J(0) — мгновенная равномерность потока: при Q = const растёт к 1")
+    rep.p("    (скорость роста неравномерности падает), при Δp = const падает (зарастание со входа).")
+    rep.p("    Накопленная относительная неравномерность R растёт в обоих режимах.")
+    rep.p(f"    Q0 = {mb['Q']['Q0']/UL_MIN:.3f} мкл/мин, Δp0 = {mb['dp']['dp0']:.1f} Па")
+
+    # ---------------- сверка с планом ----------------
+    rep.h("Сверка с планом")
+    checks = []
+    ts250 = time_scales(replace(p, R=250e-6)); ts500 = time_scales(replace(p, R=500e-6))
+    checks += [
+        ("c0, моль/л", 1.3, c0 / 1e3),
+        ("R²/a, R=250, с", 0.7, ts250["t_heat_sol"]),
+        ("R²/a, R=500, с", 2.8, ts500["t_heat_sol"]),
+        ("R²/D, R=250, с", 60, ts250["t_diff_radial"]),
+        ("L/ū max, R=500, с", 11800, ts500["t_res_max"]),
+        ("L_e(Q=2), мм", 2.0, entry_length(2 * UL_MIN, p.D) * 1e3),
+        ("Pe_T (R=250, Q=2)", 0.15, thermal_peclet(replace(p, Q_ul_min=2.0))),
+        ("Pe_T (R=500, Q=2)", 0.15, thermal_peclet(replace(p, R=500e-6, Q_ul_min=2.0))),
+        ("Q_min(10%)/Q_min(20%)", 2.1, da_limit(0.2) / da_limit(0.1)),
+        ("ΔT*(E=60, 20%), K", 3.1, float(delta_T_star(0.2, p.T_w, 60e3))),
+        ("m_max(R=250), г/м²", 9.8, m_max(c0, 250e-6) * 1e3),
+        ("ε (f=1)", 0.018, eps1),
+        ("циклов 50→0,5 мкм", 250, n_cycles(50, 0.5, eps1)),
+        ("Δp пережим r=0,5 мкм, бар", 340, dp_poiseuille(0.1 * UL_MIN, 0.5e-6, 0.5e-3, p.mu) / 1e5),
+        ("сопротивление пережима / канала", 2e6, ratio),
+        ("k Козени — Кармена, мкД", 10, kkc / DARCY * 1e6),
+        ("избирательность ΔT=10 K", 1.9, selectivity(60e3, 10, p.T_w)[0]),
+    ]
+    rows = []
+    for name, plan, calc in checks:
+        dev = abs(calc / plan - 1)
+        rows.append([name, fmt(plan), fmt(calc), "ок" if dev < 0.15 else f"≠ ({100*dev:.0f} %)"])
+    rep.table(["величина", "в плане", "расчёт", ""], rows)
+    rep.p("")
+    rep.p("Определение Sh: в плане k_эф = k_s/(1 + k_sR/(Sh·D)) при Sh = 3,66–4,36.")
+    rep.p("Для Sh по диаметру (3,66–4,36) правильно k_эф = k_s/(1 + 2k_sR/(Sh·D)) и")
+    rep.p("диффузионный предел k_эф = Sh·D/(2R). Либо Sh по радиусу = 1,83–2,18.")
+    rep.p(f"Проверка: β₁(Bi→∞)/2 = {md['beta1']/2:.4f} = Sh_R; k_эф = β₁D/(2R).")
+    rep.data["plan_checks"] = [{"name": n, "plan": a, "calc": b} for n, a, b in checks]
+
+    # ---------------- рисунки ----------------
+    if not args.no_figs:
+        fig2_times(p, figdir)
+        fig3_profiles(p, figdir, N=N)
+        fig4_delta(figdir)
+        fig5_qmin(p, figdir)
+        fig6_dTstar(p, figdir)
+        fig7_static(p, mb, figdir)
+        figS_checks(sh_rows, lev, figdir)
+        rep.p("")
+        rep.p(f"Рисунки сохранены в {figdir}/ (PNG 300 dpi и PDF).")
+
+    rep.data["params"] = {k: v for k, v in asdict(p).items()}
+    with open(os.path.join(out, "summary.json"), "w", encoding="utf-8") as f:
+        json.dump(rep.data, f, ensure_ascii=False, indent=2, default=float)
+    with open(os.path.join(out, "report.txt"), "w", encoding="utf-8") as f:
+        f.write("\n".join(rep.lines))
+
+
+if __name__ == "__main__":
+    main()
