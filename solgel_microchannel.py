@@ -58,6 +58,8 @@ from scipy.integrate import solve_ivp
 from scipy.optimize import brentq
 from scipy.special import j0, j1, jn_zeros
 
+_trapz = getattr(np, "trapezoid", None) or np.trapz
+
 # ---------------------------------------------------------------------------
 # Константы
 # ---------------------------------------------------------------------------
@@ -222,25 +224,21 @@ def _residual(beta: float, Bi: float) -> float:
 @lru_cache(maxsize=4096)
 def graetz_first_mode(Bi: float) -> dict:
     """Первое собственное значение β₁ (c̄ ∝ exp(-β₁ ζ), ζ = zD/(ūR²)),
-    точное Sh_D(Bi) и k_эф/k_s. Для Bi = inf — стенка-сток."""
+    точное Sh_D(Bi) и k_эф/k_s. Для Bi = inf — стенка-сток.
+    Корень ищется в узкой вилке, следующей из 3,657 ≤ Sh_D ≤ 4,364:
+        2Bi/(1 + 2Bi/3,657) ≤ β₁ ≤ 2Bi/(1 + 2Bi/4,364)."""
     if math.isinf(Bi):
-        hi = 3.9
+        lo, hi = 3.0, 4.0
     else:
-        hi = min(2.0 * Bi, 3.9) * (1 + 1e-9) + 1e-14
-    lo = hi * 1e-3 if not math.isinf(Bi) else 1.0
-    # сканирование до смены знака
-    grid = np.linspace(lo, hi, 60)
-    vals = [_residual(b, Bi) for b in grid]
-    beta1 = None
-    for k in range(len(grid) - 1):
-        if vals[k] == 0.0:
-            beta1 = grid[k]
-            break
-        if np.sign(vals[k]) != np.sign(vals[k + 1]):
-            beta1 = brentq(_residual, grid[k], grid[k + 1], args=(Bi,), xtol=1e-14, rtol=1e-12)
-            break
-    if beta1 is None:
-        raise RuntimeError(f"не найден корень Гретца для Bi={Bi}")
+        lo = 2.0 * Bi / (1.0 + 2.0 * Bi / 3.65) * (1 - 1e-6)
+        hi = 2.0 * Bi / (1.0 + 2.0 * Bi / 4.37) * (1 + 1e-6)
+    f_lo, f_hi = _residual(lo, Bi), _residual(hi, Bi)
+    if np.sign(f_lo) == np.sign(f_hi):          # запасной путь: сканирование
+        grid = np.linspace(lo * 0.5, min(hi * 1.5, 3.9), 40)
+        vals = [_residual(b, Bi) for b in grid]
+        k = next(i for i in range(len(grid) - 1) if np.sign(vals[i]) != np.sign(vals[i + 1]))
+        lo, hi = grid[k], grid[k + 1]
+    beta1 = brentq(_residual, lo, hi, args=(Bi,), xtol=1e-15, rtol=1e-12)
     phi1, dphi1, phib = _graetz_shoot(beta1, Bi)
     Sh = 2.0 * (-dphi1) / (phib - phi1)
     keff_over_ks = (phi1 / phib) if not math.isinf(Bi) else 0.0
@@ -535,7 +533,7 @@ def moving_boundary(p: Params, mode: str, R0: float, Da0: float, R_stop_frac=0.4
         if mode == "Q":
             Q = Q0
         else:
-            resist = 8.0 * p.mu / math.pi * np.trapezoid(1.0 / R ** 4, z)
+            resist = 8.0 * p.mu / math.pi * _trapz(1.0 / R ** 4, z)
             Q = dp0 / resist
         u = Q / (math.pi * R ** 2)
         ke = k_eff(p.ks(), R, p.D)
@@ -811,7 +809,7 @@ def figS_checks(sh_rows, lev, outdir):
 # ---------------------------------------------------------------------------
 # Основной сценарий
 # ---------------------------------------------------------------------------
-def main(argv=None):
+def main(argv=None, params: Params | None = None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
     ap.add_argument("--out", default="results")
     ap.add_argument("--quick", action="store_true")
@@ -822,7 +820,7 @@ def main(argv=None):
     os.makedirs(out, exist_ok=True)
     N = 120 if args.quick else 300
 
-    p = Params()
+    p = params if params is not None else Params()
     rep = Report()
     rep.p("Расчёт к статье: золь-гель осаждение SiO₂ в фотополимерном микроканале")
     rep.p("ВНИМАНИЕ: k_s, E, E_D, t_gel — иллюстративные значения (см. Params).")
@@ -1125,6 +1123,100 @@ def main(argv=None):
         json.dump(rep.data, f, ensure_ascii=False, indent=2, default=float)
     with open(os.path.join(out, "report.txt"), "w", encoding="utf-8") as f:
         f.write("\n".join(rep.lines))
+    return rep
+
+
+# ---------------------------------------------------------------------------
+# Интерфейс для приложения (app.html) и других скриптов
+# ---------------------------------------------------------------------------
+PARAM_INFO = {
+    # имя: (подпись, единица в интерфейсе, множитель интерфейс -> СИ)
+    "R": ("Радиус канала R", "мкм", 1e-6),
+    "L": ("Длина канала L", "мм", 1e-3),
+    "delta_w": ("Толщина стенки δ_w", "мм", 1e-3),
+    "T_w": ("Температура стенки T_w", "°C", None),
+    "Q_ul_min": ("Расход Q", "мкл/мин", 1.0),
+    "D": ("Коэффициент диффузии D", "10⁻⁹ м²/с", 1e-9),
+    "ks_ref": ("k_s при T_ref", "10⁻⁷ м/с", 1e-7),
+    "T_ref": ("T_ref", "°C", None),
+    "E": ("Энергия активации E", "кДж/моль", 1e3),
+    "E_D": ("Энергия активации диффузии E_D", "кДж/моль", 1e3),
+    "k_v": ("Объёмный расход k_v", "10⁻⁵ 1/с", 1e-5),
+    "t_gel": ("Время гелеобразования t_gel", "ч", 3600.0),
+    "h_loss": ("Теплоотдача корпуса h", "Вт/(м²·К)", 1.0),
+    "lam_wall": ("Теплопроводность стенки λ_w", "Вт/(м·К)", 1.0),
+    "mu": ("Вязкость μ", "мПа·с", 1e-3),
+    "rho_layer": ("Плотность слоя", "кг/м³", 1.0),
+}
+
+
+def params_from_ui(values: dict) -> Params:
+    """Строит Params из значений в единицах интерфейса (см. PARAM_INFO)."""
+    kw = {}
+    for k, v in values.items():
+        if k not in PARAM_INFO or v is None:
+            continue
+        mult = PARAM_INFO[k][2]
+        kw[k] = float(v) + 273.15 if mult is None else float(v) * mult
+    return replace(Params(), **kw)
+
+
+def params_to_ui(p: Params | None = None) -> dict:
+    p = Params() if p is None else p
+    out = {}
+    for k, (label, unit, mult) in PARAM_INFO.items():
+        v = getattr(p, k)
+        out[k] = {"label": label, "unit": unit,
+                  "value": round(v - 273.15, 6) if mult is None else float(f"{v / mult:.6g}")}
+    return out
+
+
+def quick_estimates(p: Params, delta_star: float = 0.2) -> dict:
+    """Мгновенные аналитические оценки для текущих параметров."""
+    ks = float(p.ks())
+    Bi = p.Bi
+    Sh = float(sh_of_bi(Bi))
+    ke = float(k_eff(ks, p.R, p.D, Sh))
+    Da = da_eff(p)
+    Ee = float(e_eff(p.E, p.E_D, ke / ks))
+    ts = time_scales(p)
+    u = p.u_mean
+    kst = k_eff_static(p)
+    Da_st = 2 * kst * p.t_gel / p.R
+    regime = "кинетический" if Bi < 0.1 else ("диффузионный" if Bi > 10 else "смешанный")
+    return {
+        "c0_mol_L": p.c0 / 1e3,
+        "ks": ks, "Bi": Bi, "regime": regime, "Sh_D": Sh, "keff": ke, "keff_over_ks": ke / ks,
+        "u_mean_um_s": u * 1e6, "Pe_T": thermal_peclet(p),
+        "L_e_mm": entry_length(p.Q, p.D) * 1e3,
+        "Da_eff": Da, "delta_pct": 100 * float(nonuniformity(Da)),
+        "Da_limit": da_limit(delta_star),
+        "Qmin_ul_min": q_min(p, delta_star) / UL_MIN,
+        "Qmin10_ul_min": q_min(p, 0.1) / UL_MIN,
+        "E_eff_kJ": Ee / 1e3,
+        "dTstar_K": float(delta_T_star(delta_star, p.T_w, Ee)),
+        "dTstar_exact_K": float(delta_T_star(delta_star, p.T_w, Ee, exact=True)),
+        "t_heat_sol": ts["t_heat_sol"], "t_heat_wall": ts["t_heat_wall"],
+        "t_diff": ts["t_diff_radial"], "t_res": p.L / u,
+        "m_max_g_m2": m_max(p.c0, p.R) * 1e3,
+        "h_eq_um": m_max(p.c0, p.R) / p.rho_layer * 1e6,
+        "Da_st": Da_st,
+        "m_frac_tgel": float(static_deposit_fraction(p.t_gel, p)[0]),
+        "eps": narrowing_epsilon(1.0, p.c0, p.rho_layer),
+        "fin_length_mm": fin_length(p) * 1e3,
+        "u_nc_um_s": natural_convection_velocity(p, 3.0 / p.L) * 1e6,
+    }
+
+
+FIGURES = [
+    ("fig2_times", "Рис. 2. Характерные времена для R = 250 и 500 мкм"),
+    ("fig3_profiles", "Рис. 3. c̄(z) и J(z): численное решение и аналитика"),
+    ("fig4_delta_vs_Da", "Рис. 4. Неравномерность δ от Da_эф"),
+    ("fig5_Qmin_vs_Tw", "Рис. 5. Минимальный расход Q_min от T_w"),
+    ("fig6_dTstar", "Рис. 6. Допустимая неоднородность ΔT* от k_эф/k_s"),
+    ("fig7_static_narrowing", "Рис. 7. Статика, циклы сужения, профили R(z)"),
+    ("figS_checks_Sh_Leveque", "Проверка: Sh(Bi) и решение Левека"),
+]
 
 
 if __name__ == "__main__":
