@@ -88,7 +88,9 @@ class Params:
     H_block: float = 30e-3       # высота блока, м (канал длиной L — по центру)
     T_air: float = 293.15        # температура воздуха, К
     T_in: float = 293.15         # температура поступающего золя, К
-    heating: str = "side"        # "side" — боковая поверхность; "bottom" — торец на плитке
+    heating: str = "side"        # "side" — боковая поверхность, торцы открыты (лаборатория);
+    #                              "bottom" — торец на плитке; "holder" — кернодержатель:
+    #                              рубашка на боковой поверхности и торцевые заглушки при уставке
     orientation: str = "vertical"  # "vertical" | "horizontal" — ориентация оси канала
     # перенос в золе (основа — этанол)
     D: float = 1e-9              # коэффициент диффузии, м²/с
@@ -108,6 +110,7 @@ class Params:
     E_D: float = 14e3            # кажущаяся энергия активации диффузии (≈ вязкость EtOH)
     k_v: float = 0.0             # объёмный расход на поликонденсацию, 1/с
     t_gel: float = 3 * 3600.0    # время гелеобразования при 60 °C, с
+    t_treat: float = 3600.0      # время обработки в протоке (раздел 8), с
     # осадок
     rho_layer: float = 2200.0    # плотность плотного SiO₂, кг/м³
     # состав золя ТЭОС : EtOH : H2O : HCl (мольн.)
@@ -239,7 +242,8 @@ def block_temperature(p: Params, Q_ul_min: float = 0.0, Nz: int = 300, dr_max: f
     учитывается конвективным членом в ячейках золя (схема против потока).
     Граничные условия:
       heating = "side":   r = R_block — T = T_w (уставка); торцы — теплоотдача h в воздух;
-      heating = "bottom": z = 0 — T = T_w; боковая поверхность и верхний торец — h.
+      heating = "bottom": z = 0 — T = T_w; боковая поверхность и верхний торец — h;
+      heating = "holder": боковая поверхность и оба торца (заглушки) — T = T_w.
     Возвращает z (центры ячеек), T_w(z) на стенке канала r = R и поле T(r, z)."""
     rf, zf = _block_grid(p, dr_max=dr_max, Nz=Nz)
     rc = 0.5 * (rf[1:] + rf[:-1])
@@ -277,8 +281,9 @@ def block_temperature(p: Params, Q_ul_min: float = 0.0, Nz: int = 300, dr_max: f
             G = area / (1.0 / cond_half + 1.0 / p.h_loss)
         diag[k] -= G; b[k] -= G * T_amb
 
-    side_dir = p.heating == "side"
-    bot_dir = p.heating == "bottom"
+    side_dir = p.heating in ("side", "holder")
+    bot_dir = p.heating in ("bottom", "holder")
+    top_dir = p.heating == "holder"
     for j in range(nz):                               # боковая поверхность
         k = idx(nr - 1, j)
         to_ambient(k, lam[-1] / (rf[-1] - rc[-1]), 2 * np.pi * rf[-1] * dz[j],
@@ -286,7 +291,8 @@ def block_temperature(p: Params, Q_ul_min: float = 0.0, Nz: int = 300, dr_max: f
     for i in range(nr):                               # торцы
         to_ambient(idx(i, 0), lam[i] / (0.5 * dz[0]), area_z[i],
                    p.T_w if bot_dir else p.T_air, bot_dir)
-        to_ambient(idx(i, nz - 1), lam[i] / (0.5 * dz[-1]), area_z[i], p.T_air, False)
+        to_ambient(idx(i, nz - 1), lam[i] / (0.5 * dz[-1]), area_z[i],
+                   p.T_w if top_dir else p.T_air, top_dir)
 
     # проток в канале: ρc·Q_i·(T_{j-1} − T_j), вход при z = 0 с T_in
     if Q_ul_min > 0:
@@ -740,7 +746,8 @@ def _mb_state(p: Params, R, z, mode, Q0, dp0):
 
 
 def moving_boundary(p: Params, mode: str, R0: float, Da0: float, R_stop_frac=0.4,
-                    Nz=300, snapshots=(1.0, 0.8, 0.6, 0.4), t_max=1e7, cfl=0.002):
+                    Nz=300, snapshots=(1.0, 0.8, 0.6, 0.4), t_max=1e7, cfl=0.002,
+                    record_every: int = 0):
     """Квазистационарное сужение R(z,t):
         dR/dt = -(M/ρ_сл) k_эф(R) c̄(z,t),
         dc̄/dz = -(2 k_эф/(R ū) + k_v/ū) c̄,  ū = Q/(πR²).
@@ -759,8 +766,11 @@ def moving_boundary(p: Params, mode: str, R0: float, Da0: float, R_stop_frac=0.4
     targets = sorted(snapshots, reverse=True)
     R_prev, t_prev, frac_prev = R.copy(), 0.0, 1.0
     nsteps = 0
+    history = []
     while True:
         frac = R.min() / R0
+        if record_every and nsteps % record_every == 0:
+            history.append((t, R.copy()))
         while targets and frac <= targets[0] + 1e-12:
             tg = targets.pop(0)
             w = 1.0 if frac_prev == frac else (frac_prev - tg) / (frac_prev - frac)
@@ -778,7 +788,128 @@ def moving_boundary(p: Params, mode: str, R0: float, Da0: float, R_stop_frac=0.4
         R = R + dRdt * dt
         t += dt
         nsteps += 1
-    return {"z": z, "snaps": snaps, "Q0": Q0, "dp0": dp0, "nsteps": nsteps}
+    if record_every:
+        history.append((t, R.copy()))
+    return {"z": z, "snaps": snaps, "Q0": Q0, "dp0": dp0, "nsteps": nsteps, "history": history}
+
+
+# ---------------------------------------------------------------------------
+# Раздел 8. Распределение кремнезёма: m(z, t), h(z, t), поля для визуализации
+# ---------------------------------------------------------------------------
+ILLUSTR_NOTE = ("k_s, E, t_gel — иллюстративные: абсолютные m и h условны, "
+                "форма распределения — нет")
+THERMAL_CONFIGS = (("side", "лаборатория (открытые торцы)"), ("holder", "кернодержатель"))
+
+
+@lru_cache(maxsize=128)
+def _block_cached(p: Params, Q_ul_min: float, Nz: int):
+    return block_temperature(p, Q_ul_min, Nz=Nz)
+
+
+def wall_T_function(p: Params, Q_ul_min: float = 0.0, Nz: int = 200):
+    """T_w(z) на стенке канала (z — от входа канала) из решения для блока."""
+    blk = _block_cached(p, float(Q_ul_min), int(Nz))
+    zb, Tw = blk["z"] - p.z_ch0, blk["Tw"]
+    return lambda z: np.interp(z, zb, Tw)
+
+
+def flow_deposit(p: Params, Q_ul_min: float, t: float | None = None, Nz_blk: int = 200, nz: int = 501):
+    """Проток: m(z, t) = ∫J dt = J(z)·t, J = M·k_эф(T_w(z))·c̄(z) (квазистационарно,
+    сужение просвета не учитывается, h ≪ R). T_w(z) — из блока с этим же протоком.
+    Возвращает z, m (кг/м²), h (м), T_w(z)."""
+    t = p.t_treat if t is None else t
+    pq = replace(p, Q_ul_min=Q_ul_min)
+    Tf = wall_T_function(p, Q_ul_min, Nz_blk)
+    z, Jrel = deposition_profile(pq, Tf, Nz=nz)        # k_эф·c̄/c0
+    J = M_SIO2 * p.c0 * Jrel                           # кг/(м²·с)
+    m = J * t
+    return z, m, m / p.rho_layer, Tf(z)
+
+
+@lru_cache(maxsize=64)
+def _static_cached(p: Params, Nz_blk: int, nz: int, t: float):
+    Tf = wall_T_function(p, 0.0, Nz_blk)
+    zc = np.linspace(0.0, p.L, nz)
+    Tc = Tf(zc)
+    frac = np.array([float(static_deposit_fraction(t, replace(p, T_w=float(T)))[0]) for T in Tc])
+    return zc, frac, Tc
+
+
+def static_deposit(p: Params, t: float | None = None, Nz_blk: int = 200, nz: int = 41, nz_out: int = 501):
+    """Статика: в каждом сечении закрытый канал с k_s(T_w(z)) реального блока;
+    m(z, t) = m_max·доля(t), t ≤ t_gel (осевой диффузией пренебрегаем, L ≫ R).
+    Возвращает z, m (кг/м²), h (м), T_w(z)."""
+    t = p.t_gel if t is None else min(t, p.t_gel)
+    zc, frac, Tc = _static_cached(p, int(Nz_blk), int(nz), float(t))
+    z = np.linspace(0.0, p.L, nz_out)
+    m = m_max(p.c0, p.R) * np.interp(z, zc, frac)
+    return z, m, m / p.rho_layer, np.interp(z, zc, Tc)
+
+
+def deposit_stats(z, h, L, l_in=0.0, l_out=0.0) -> dict:
+    """h на входе, в середине, на выходе; неоднородность 1 − h_min/h_max по каналу
+    и по рабочему участку без торцевых зон."""
+    w = (z >= l_in - 1e-12) & (z <= L - l_out + 1e-12)
+    clean = lambda x: 0.0 if abs(x) < 1e-9 else float(x)          # машинный ноль → 0
+    return {"h_in": float(h[0]), "h_mid": float(np.interp(0.5 * L, z, h)), "h_out": float(h[-1]),
+            "nonuni_channel": clean(1.0 - h.min() / h.max()),
+            "nonuni_work": clean(1.0 - h[w].min() / h[w].max()) if w.any() else float("nan")}
+
+
+def march_field(p: Params, Q_ul_min: float, Tw_fun, N: int = 40, n_out: int = 240):
+    """Поле c(r, z)/c0 в протоке: маршевое решение с переменным Bi(z) = k_s(T_w(z))R/D
+    (та же схема, что march_solution). Возвращает z (м), η = r/R, c (N × n_out)."""
+    pq = replace(p, Q_ul_min=Q_ul_min)
+    u_m = pq.u_mean
+    zeta_L = p.L * p.D / (u_m * p.R ** 2)
+    dr = 1.0 / N
+    eta = (np.arange(N) + 0.5) * dr
+    eta_f = np.arange(N + 1) * dr
+    u = 2.0 * (1.0 - eta ** 2)
+    wvol = eta * dr
+    Da_v = p.k_v * p.R ** 2 / p.D
+    rows, cols, vals = [], [], []
+    for i in range(N):
+        diag = -Da_v * wvol[i]
+        if i > 0:
+            g = eta_f[i] / dr
+            rows += [i]; cols += [i - 1]; vals += [g]; diag -= g
+        if i < N - 1:
+            g = eta_f[i + 1] / dr
+            rows += [i]; cols += [i + 1]; vals += [g]; diag -= g
+        rows += [i]; cols += [i]; vals += [diag]
+    Minv = 1.0 / (u * wvol)
+    A0 = sparse.diags(Minv) @ sparse.csr_matrix((vals, (rows, cols)), shape=(N, N))
+    e = np.zeros(N); e[-1] = 1.0
+    E = sparse.csr_matrix((np.array([1.0]), (np.array([N - 1]), np.array([N - 1]))), shape=(N, N))
+    wall_scale = eta_f[N] * Minv[-1]
+
+    def wall(zeta):
+        z = zeta * u_m * p.R ** 2 / p.D
+        Bi = float(p.ks(Tw_fun(min(z, p.L)))) * p.R / p.D
+        return wall_scale * Bi / (1.0 + Bi * dr / 2.0)
+
+    fun = lambda zt, y: A0 @ y - wall(zt) * y[-1] * e
+    jac = lambda zt, y: A0 - wall(zt) * E
+    t_eval = np.linspace(0.0, zeta_L, n_out)
+    sol = solve_ivp(fun, (0.0, zeta_L), np.ones(N), method="BDF", jac=jac, t_eval=t_eval,
+                    rtol=1e-7, atol=1e-10)
+    return sol.t * u_m * p.R ** 2 / p.D, eta, sol.y
+
+
+def static_field(p: Params, Tw_fun, t: float, N: int = 40, nz: int = 61, n_modes: int = 30):
+    """Поле c(r, z, t)/c0 в закрытом канале: в каждом сечении ряд по модам
+    c/c0 = Σ B_n J0(λ_n η) exp(−λ_n² D t/R²)·exp(−k_v t), B_n = 2Bi/((λ_n² + Bi²) J0(λ_n))."""
+    z = np.linspace(0.0, p.L, nz)
+    eta = (np.arange(N) + 0.5) / N
+    c = np.zeros((N, nz))
+    for k, zk in enumerate(z):
+        pz = replace(p, T_w=float(Tw_fun(zk)))
+        Bi = pz.Bi
+        lam, _ = static_modes(Bi, n_modes)
+        B = 2.0 * Bi / ((lam ** 2 + Bi ** 2) * j0(lam))
+        c[:, k] = (B * j0(np.outer(eta, lam)) * np.exp(-lam ** 2 * p.D * t / p.R ** 2)).sum(axis=1)
+    return z, eta, np.clip(c * math.exp(-p.k_v * t), 0.0, 1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -1071,6 +1202,306 @@ def figS_checks(sh_rows, lev, outdir):
 
 
 # ---------------------------------------------------------------------------
+# Рисунки раздела 8 (визуализация распределения кремнезёма)
+# ---------------------------------------------------------------------------
+LAYER = "#eb6834"        # слой SiO₂ (категориальный слот 2)
+WALL = "#d9d8d0"         # фотополимер
+
+
+def _nice_factor(x):
+    """Ближайший «круглый» коэффициент увеличения ≤ x (1, 2, 5 × 10ⁿ)."""
+    if x <= 1:
+        return 1
+    e = 10 ** math.floor(math.log10(x))
+    for k in (5, 2, 1):
+        if k * e <= x:
+            return int(k * e)
+    return int(e)
+
+
+def _note(fig, y=0.0):
+    fig.text(0.01, y, ILLUSTR_NOTE, fontsize=6.5, color=INK2, ha="left", va="bottom")
+
+
+def _layer_strip(ax, z_mm, R_um, h_um, K, c_field=None, z_field_mm=None, eta=None, cmap="Blues"):
+    """Продольный разрез r–z: поле c/c0 (зеркально), стенка, слой толщиной K·h внутрь канала."""
+    if c_field is not None:
+        rr = np.concatenate([-eta[::-1], eta]) * R_um
+        cc = np.vstack([c_field[::-1], c_field])
+        mesh = ax.pcolormesh(z_field_mm, rr, cc, cmap=cmap, vmin=0, vmax=1, shading="nearest",
+                             rasterized=True)
+    else:
+        mesh = None
+    ax.fill_between(z_mm, R_um - K * h_um, R_um, color=LAYER, lw=0)
+    ax.fill_between(z_mm, -R_um, -R_um + K * h_um, color=LAYER, lw=0)
+    ax.axhspan(R_um, 1.25 * R_um, color=WALL, lw=0)
+    ax.axhspan(-1.25 * R_um, -R_um, color=WALL, lw=0)
+    ax.axhline(R_um, color=INK2, lw=0.6); ax.axhline(-R_um, color=INK2, lw=0.6)
+    ax.set_ylim(-1.25 * R_um, 1.25 * R_um)
+    ax.set_xlim(z_mm[0], z_mm[-1])
+    ax.grid(False)
+    return mesh
+
+
+def figV1_section(p: Params, cfg: str, cfg_label: str, outdir: str, Qmin_ul: float):
+    """Рис. В1: продольный разрез канала — поле c(r,z)/c0 и слой осадка; три полосы:
+    проток при Q_min, проток при 0,1 мкл/мин, статика (t_gel)."""
+    plt = _style()
+    pc = replace(p, heating=cfg)
+    R_um = p.R * 1e6
+    cases = []
+    for Qv in (Qmin_ul, 0.1):
+        Tf = wall_T_function(pc, Qv)
+        zf, eta, c = march_field(pc, Qv, Tf)
+        z, m, h, _ = flow_deposit(pc, Qv)
+        cases.append((f"Проток, Q = {Qv:.2g} мкл/мин, t = {p.t_treat/3600:.3g} ч", zf, eta, c, z, h))
+    Tf0 = wall_T_function(pc, 0.0)
+    zs, eta_s, cs = static_field(pc, Tf0, p.t_gel)
+    z, m, h, _ = static_deposit(pc)
+    cases.append((f"Статика, t = t_gel = {p.t_gel/3600:.3g} ч (c/c0 в момент t_gel)", zs, eta_s, cs, z, h))
+    hmax = max(cc[5].max() for cc in cases) * 1e6
+    K = _nice_factor(0.35 * R_um / hmax)
+    fig, axs = plt.subplots(3, 1, figsize=(7.2, 5.6), sharex=True)
+    for ax, (title, zf, eta, c, z, h) in zip(axs, cases):
+        mesh = _layer_strip(ax, z * 1e3, R_um, h * 1e6, K, c, zf * 1e3, eta)
+        st = deposit_stats(z, h, p.L)
+        ax.set_title(f"{title};  h = {h.min()*1e6:.2g}…{h.max()*1e6:.2g} мкм, "
+                     f"1 − h_min/h_max = {100*st['nonuni_channel']:.0f} %", loc="left", fontsize=7.5)
+        ax.set_ylabel("r, мкм")
+    axs[-1].set_xlabel("z от входа канала, мм")
+    cb = fig.colorbar(mesh, ax=axs, shrink=0.8, pad=0.015)
+    cb.set_label("c / c₀ (кремний в золе)")
+    axs[0].text(0.995, 1.02, f"толщина слоя ×{K}", transform=axs[0].transAxes, ha="right", va="bottom",
+                fontsize=8, color=LAYER, fontweight="bold")
+    fig.suptitle(f"Продольный разрез канала, R = {R_um:.0f} мкм: {cfg_label}", x=0.01, ha="left",
+                 fontsize=9)
+    _note(fig)
+    name = f"figV1_section_{cfg}"
+    os.makedirs(outdir, exist_ok=True)
+    fig.savefig(os.path.join(outdir, name + ".png"), bbox_inches="tight")
+    fig.savefig(os.path.join(outdir, name + ".pdf"), bbox_inches="tight")
+    plt.close(fig)
+    return name, K
+
+
+def figV2_block_T(p: Params, outdir: str, Q_ul: float):
+    """Рис. В2: поле T(r, z) во всём блоке для двух тепловых конфигураций (с протоком Q);
+    нижний ряд — увеличенный участок у входа канала."""
+    plt = _style()
+    fig = plt.figure(figsize=(7.0, 6.4))
+    gs = fig.add_gridspec(2, 2, height_ratios=[3.0, 1.3], hspace=0.32, wspace=0.18)
+    levels = np.arange(44.0, 60.01, 0.5)
+    lines = [46, 48, 50, 52, 54, 56, 57, 58, 59, 59.5, 59.9]
+    cf = None
+    axes_top = []
+    for j, (cfg, lab) in enumerate(THERMAL_CONFIGS):
+        ax = fig.add_subplot(gs[0, j], sharey=axes_top[0] if axes_top else None)
+        axz = fig.add_subplot(gs[1, j])
+        axes_top.append(ax)
+        pc = replace(p, heating=cfg)
+        blk = _block_cached(pc, float(Q_ul), 200)
+        r = blk["r"] * 1e3; z = blk["z"] * 1e3
+        rr = np.concatenate([-r[::-1], r])
+        TT = np.hstack([blk["T"][:, ::-1], blk["T"]]) - 273.15
+        Tset = p.T_w - 273.15
+        if TT.max() - TT.min() > 2.0 and cfg != "holder":
+            lv = [l for l in lines if TT.min() < l < TT.max()]
+        else:                                    # почти изотермический блок: мелкие изотермы
+            lv = [Tset - d for d in (5.0, 1.0, 0.3, 0.1, 0.03) if Tset - d > TT.min()]
+        for a_, zlim, rlim in ((ax, None, None), (axz, 4.0, 1.0)):
+            m_ = slice(None) if zlim is None else (z <= zlim)
+            cf = a_.contourf(rr, z[m_], np.clip(TT[m_], levels[0], levels[-1]), levels=levels, cmap="Oranges")
+            cs = a_.contour(rr, z[m_], TT[m_], levels=lv, colors=INK, linewidths=0.5)
+            a_.clabel(cs, fmt=lambda v: f"{v:.2f}".rstrip("0").rstrip("."), fontsize=5.5)
+            for x in (-p.R * 1e3, p.R * 1e3):
+                a_.plot([x, x], [0, p.H_block * 1e3 if zlim is None else zlim], color=C[0], lw=0.9)
+            a_.plot([-1.2, 1.2], [p.z_ch0 * 1e3] * 2, color=C[0], lw=0.9)
+            if zlim is None:
+                a_.plot([-1.2, 1.2], [(p.z_ch0 + p.L) * 1e3] * 2, color=C[0], lw=0.9)
+                a_.set_aspect("equal")
+            else:
+                a_.set_xlim(-rlim, rlim); a_.set_ylim(0, zlim)
+            a_.grid(False)
+        ax.set_xlabel("r, мм")
+        Tm = float(np.interp(p.H_block / 2, blk["z"], blk["Tw"])) - 273.15
+        ax.set_title(f"{lab}\nT_w(середина) = {Tm:.1f} °C", loc="left", fontsize=7.5)
+        Tw_ch = np.interp(np.linspace(p.z_ch0, p.z_ch0 + p.L, 501), blk["z"], blk["Tw"]) - 273.15
+        axz.set_title(f"у входа (увеличено): T_w на канале {Tw_ch.min():.1f}…{Tw_ch.max():.1f} °C,\n"
+                      f"золь у входа от {TT.min():.0f} °C", loc="left", fontsize=6.5)
+        axz.set_xlabel("r, мм")
+        if j == 0:
+            ax.set_ylabel("z, мм (вход золя снизу)")
+            axz.set_ylabel("z, мм")
+    cb = fig.colorbar(cf, ax=fig.axes, shrink=0.7, pad=0.02)
+    cb.set_label("T, °C")
+    fig.suptitle(f"Поле температуры в блоке Ø{2*p.R_block*1e3:.0f} × {p.H_block*1e3:.0f} мм, уставка "
+                 f"{p.T_w-273.15:.0f} °C, проток {Q_ul:.2g} мкл/мин. Синим — стенки канала "
+                 f"(R = {p.R*1e6:.0f} мкм, в масштабе) и концы канала L = {p.L*1e3:g} мм",
+                 x=0.01, ha="left", fontsize=7.5)
+    name = "figV2_block_temperature"
+    fig.savefig(os.path.join(outdir, name + ".png"), bbox_inches="tight")
+    fig.savefig(os.path.join(outdir, name + ".pdf"), bbox_inches="tight")
+    plt.close(fig)
+    return name
+
+
+def figV3_h(p: Params, outdir: str, t_treat: float | None = None, Q_user: float | None = None,
+            name: str = "figV3_h_profiles", Nz_blk: int = 200):
+    """Рис. В3: h(z) вдоль канала; проток при Q_min и при 0,1 мкл/мин (или Q_user), статика;
+    строки — R = 250 и 500 мкм, столбцы — тепловые конфигурации; справа — m, г/м²."""
+    plt = _style()
+    t_treat = p.t_treat if t_treat is None else t_treat
+    fig, axs = plt.subplots(2, 2, figsize=(7.2, 4.8), sharex=True)
+    rows = []
+    for i, R in enumerate((250e-6, 500e-6)):
+        for j, (cfg, lab) in enumerate(THERMAL_CONFIGS):
+            ax = axs[i, j]
+            pc = replace(p, R=R, heating=cfg)
+            ks = float(pc.ks()); Ee = float(e_eff(pc.E, pc.E_D, float(k_eff(ks, R, pc.D)) / ks))
+            wa = wall_profile_analysis(pc, _block_cached(pc, 0.0, Nz_blk),
+                                       float(delta_T_star(0.2, pc.T_w, Ee)))
+            if wa["l_end_in"] > 0:
+                ax.axvspan(0, wa["l_end_in"] * 1e3, color=INK2, alpha=0.13, lw=0)
+                ax.axvspan((p.L - wa["l_end_out"]) * 1e3, p.L * 1e3, color=INK2, alpha=0.13, lw=0)
+            ax.axvspan(wa["l_end_in"] * 1e3, (p.L - wa["l_end_out"]) * 1e3, color=C[2], alpha=0.06, lw=0)
+            qm = q_min(pc, 0.2) / UL_MIN
+            q2 = 0.1 if Q_user is None else Q_user
+            series = [("проток, Q = Q_min", C[0], "-", flow_deposit(pc, qm, t_treat, Nz_blk)),
+                      (f"проток, Q = {q2:.2g} мкл/мин", C[1], "-", flow_deposit(pc, q2, t_treat, Nz_blk)),
+                      (f"статика до t_gel = {pc.t_gel/3600:.3g} ч", C[2], "--", static_deposit(pc, Nz_blk=Nz_blk))]
+            for lab_s, col, ls, (z, m, h, _) in series:
+                ax.plot(z * 1e3, h * 1e6, color=col, ls=ls, label=lab_s)
+                st = deposit_stats(z, h, p.L, wa["l_end_in"], wa["l_end_out"])
+                rows.append({"R": R, "cfg": cfg, "series": lab_s, **st})
+            ax.set_ylim(0, None)
+            sec = ax.secondary_yaxis("right", functions=(lambda x, rho=pc.rho_layer: x * rho * 1e-3,
+                                                         lambda x, rho=pc.rho_layer: x / (rho * 1e-3)))
+            sec.set_ylabel("m, г/м²", color=INK2) if j == 1 else None
+            ax.set_title(f"{lab}\nR = {R*1e6:.0f} мкм, Q_min = {qm:.2g} мкл/мин", loc="left", fontsize=7.5)
+            if j == 0:
+                ax.set_ylabel("h (плотный SiO₂), мкм")
+            if i == 1:
+                ax.set_xlabel("z от входа канала, мм")
+
+    fig.suptitle(f"Толщина слоя h(z) после t = {t_treat/3600:.3g} ч протока; серым — торцевые зоны "
+                 "|ΔT_w| > ΔT*, зелёным — рабочий участок", x=0.01, ha="left", fontsize=8)
+    fig.tight_layout(rect=(0, 0.07, 1, 0.95))
+    hnd, lbl = axs[0, 0].get_legend_handles_labels()
+    fig.legend(hnd, lbl, loc="lower center", ncol=3, fontsize=7, bbox_to_anchor=(0.5, 0.025))
+    _note(fig, 0.0)
+    os.makedirs(outdir, exist_ok=True)
+    fig.savefig(os.path.join(outdir, name + ".png"), bbox_inches="tight")
+    if name == "figV3_h_profiles":
+        fig.savefig(os.path.join(outdir, name + ".pdf"), bbox_inches="tight")
+    plt.close(fig)
+    return name, rows
+
+
+def figV4_rings(p: Params, outdir: str, Q_ul: float = 0.1):
+    """Рис. В4: поперечные сечения у входа, в середине и у выхода — кольцо осадка в масштабе."""
+    plt = _style()
+    from matplotlib.patches import Circle
+    cases = []
+    for cfg, lab in THERMAL_CONFIGS:
+        pc = replace(p, heating=cfg)
+        cases.append((f"{lab}: проток {Q_ul:g} мкл/мин, {p.t_treat/3600:.3g} ч", flow_deposit(pc, Q_ul)))
+        cases.append((f"{lab}: статика до t_gel", static_deposit(pc)))
+    R_um = p.R * 1e6
+    fig, axs = plt.subplots(len(cases), 3, figsize=(5.4, 7.6))
+    for i, (title, (z, m, h, T)) in enumerate(cases):
+        for j, (zz, nm) in enumerate(((0.0, "вход"), (0.5 * p.L, "середина"), (p.L, "выход"))):
+            ax = axs[i, j]
+            hz = float(np.interp(zz, z, h)) * 1e6
+            Tz = float(np.interp(zz, z, T)) - 273.15
+            ax.add_patch(Circle((0, 0), 1.3 * R_um, color=WALL, lw=0))
+            ax.add_patch(Circle((0, 0), R_um, color=LAYER, lw=0))
+            ax.add_patch(Circle((0, 0), R_um - hz, color="white", lw=0))
+            ax.add_patch(Circle((0, 0), R_um, fill=False, color=INK2, lw=0.5))
+            ax.set_xlim(-1.3 * R_um, 1.3 * R_um); ax.set_ylim(-1.3 * R_um, 1.3 * R_um)
+            ax.set_aspect("equal"); ax.axis("off")
+            ax.text(0, 0, f"h = {hz:.2g} мкм\n{Tz:.1f} °C", ha="center", va="center", fontsize=6.5)
+            ax.set_title(nm, fontsize=7, color=INK2, pad=2)
+        axs[i, 0].text(-0.05, 1.32, title, transform=axs[i, 0].transAxes, fontsize=7.5,
+                       ha="left", va="bottom")
+    fig.subplots_adjust(hspace=0.62, wspace=0.05, top=0.87, bottom=0.04, left=0.03, right=0.97)
+    fig.suptitle(f"Поперечные сечения, R = {R_um:.0f} мкм, масштаб 1:1 (оранжевое — слой SiO₂)",
+                 x=0.01, ha="left", fontsize=8, y=0.99)
+    _note(fig, 0.0)
+    name = "figV4_cross_sections"
+    fig.savefig(os.path.join(outdir, name + ".png"), bbox_inches="tight")
+    fig.savefig(os.path.join(outdir, name + ".pdf"), bbox_inches="tight")
+    plt.close(fig)
+    return name
+
+
+def animV5_growth(p: Params, outdir: str, mb_Q: dict, mb_dp: dict, Q_ul: float = 0.1,
+                  n_frames: int = 40, fps: int = 6, dpi: int = 90):
+    """Анимация GIF (PillowWriter): рост слоя в протоке (лабораторная конфигурация)
+    и сужение канала R0 = 50 мкм при Q = const и Δp = const."""
+    plt = _style()
+    from matplotlib.animation import FuncAnimation, PillowWriter
+    pc = replace(p, heating="side")
+    z, m, h_end, _ = flow_deposit(pc, Q_ul)
+    zf, eta, c = march_field(pc, Q_ul, wall_T_function(pc, Q_ul))
+    R_um = p.R * 1e6
+    K = _nice_factor(0.35 * R_um / (h_end.max() * 1e6))
+    fig, axs = plt.subplots(3, 1, figsize=(7.0, 6.0))
+    nonuni_flow = 1 - h_end.min() / h_end.max()
+
+    def hist_at(mb, frac):
+        H = mb["history"]; t_end = H[-1][0]
+        tt = frac * t_end
+        k = min(np.searchsorted([x[0] for x in H], tt), len(H) - 1)
+        return H[k]
+
+    R0 = mb_Q["history"][0][1][0]
+
+    def draw(k):
+        frac = k / (n_frames - 1)
+        for ax in axs:
+            ax.clear()
+        t = frac * p.t_treat
+        _layer_strip(axs[0], z * 1e3, R_um, h_end * frac * 1e6, K, c, zf * 1e3, eta)
+        axs[0].set_title(f"Проток Q = {Q_ul:g} мкл/мин (лаборатория, R = {R_um:.0f} мкм), "
+                         f"t = {t/60:.0f} мин;  1 − h_min/h_max = "
+                         f"{100*nonuni_flow:.0f} %;  слой ×{K}" if k else
+                         f"Проток Q = {Q_ul:g} мкл/мин, t = 0", loc="left", fontsize=7.5)
+        axs[0].set_ylabel("r, мкм")
+        for ax, mb, nm in ((axs[1], mb_Q, "Q = const"), (axs[2], mb_dp, "Δp = const")):
+            t_s, Rz = hist_at(mb, frac)
+            zz = mb["z"] * 1e3
+            ax.fill_between(zz, Rz * 1e6, R0 * 1e6, color=LAYER, lw=0)
+            ax.fill_between(zz, -R0 * 1e6, -Rz * 1e6, color=LAYER, lw=0)
+            ax.axhspan(R0 * 1e6, 1.2 * R0 * 1e6, color=WALL, lw=0)
+            ax.axhspan(-1.2 * R0 * 1e6, -R0 * 1e6, color=WALL, lw=0)
+            ax.set_ylim(-1.2 * R0 * 1e6, 1.2 * R0 * 1e6); ax.set_xlim(zz[0], zz[-1])
+            hz = R0 - Rz
+            nu = f"{100*(1 - hz.min()/hz.max()):.0f} %" if hz.max() > 0 else "—"
+            ax.set_title(f"Сужение, {nm}: R₀ = {R0*1e6:.0f} мкм, t = {t_s/3600:.2f} ч, "
+                         f"min R/R₀ = {Rz.min()/R0:.2f};  1 − h_min/h_max = {nu} (слой без увеличения)",
+                         loc="left", fontsize=7.5)
+            ax.set_ylabel("r, мкм"); ax.grid(False)
+        axs[2].set_xlabel("z от входа канала, мм")
+        return []
+
+    fig.subplots_adjust(hspace=0.55, top=0.95, bottom=0.09, left=0.09, right=0.98)
+    fig.text(0.01, 0.003, ILLUSTR_NOTE, fontsize=6, color=INK2)
+    anim = FuncAnimation(fig, draw, frames=n_frames, blit=False)
+    name = "anim_layer_growth.gif"
+    anim.save(os.path.join(outdir, name), writer=PillowWriter(fps=fps), dpi=dpi)
+    plt.close(fig)
+    return name
+
+
+def render_h_figure_png(p: Params, path: str, t_treat_h: float, Q_ul: float, Nz_blk: int = 120):
+    """Для интерфейса: перестраивает рис. В3 при заданных t (ч) и Q (мкл/мин) и сохраняет PNG."""
+    outdir, fname = os.path.split(path)
+    name, rows = figV3_h(p, outdir or ".", t_treat=t_treat_h * 3600.0, Q_user=Q_ul,
+                         name=os.path.splitext(fname)[0], Nz_blk=Nz_blk)
+    return rows
+
+
+# ---------------------------------------------------------------------------
 # Основной сценарий
 # ---------------------------------------------------------------------------
 def main(argv=None, params: Params | None = None):
@@ -1104,7 +1535,8 @@ def main(argv=None, params: Params | None = None):
     dTs20 = float(delta_T_star(0.2, p.T_w, Ee_c))
     blk0 = block_temperature(p, 0.0, Nz=Nz_blk)
     wa = wall_profile_analysis(p, blk0, dTs20)
-    heat_name = {"side": "боковая поверхность при уставке", "bottom": "нижний торец на плитке"}[p.heating]
+    heat_name = {"side": "боковая поверхность при уставке", "bottom": "нижний торец на плитке",
+                 "holder": "кернодержатель: рубашка и заглушки при уставке"}[p.heating]
     rep.p(f"Блок: цилиндр Ø{2*p.R_block*1e3:.0f} × {p.H_block*1e3:.0f} мм, λ_w = {p.lam_wall} Вт/(м·К), "
           f"h = {p.h_loss:g} Вт/(м²·К), T_возд = {p.T_air-273.15:.0f} °C")
     rep.p(f"Нагрев: {heat_name} {p.T_w-273.15:.0f} °C; канал {p.orientation == 'vertical' and 'вертикальный' or 'горизонтальный'}, "
@@ -1547,6 +1979,77 @@ def main(argv=None, params: Params | None = None):
     rep.p(f"Проверка: β₁(Bi→∞)/2 = {md['beta1']/2:.4f} = Sh по радиусу; k_эф = β₁D/(2R).")
     rep.data["plan_checks"] = [{"name": n, "plan": a, "calc": b} for n, a, b in checks]
 
+    # ---------------- раздел 8 ----------------
+    rep.h("8. Визуализация распределения кремнезёма")
+    rep.p("ВНИМАНИЕ: " + ILLUSTR_NOTE + ".")
+    rep.p(f"Проток: m(z, t) = M_SiO₂·k_эф(T_w(z))·c̄(z)·t, t = {p.t_treat/3600:g} ч; T_w(z) — из поля блока")
+    rep.p("с тем же протоком. Статика: в каждом сечении закрытый канал с k_s(T_w(z)) реального блока,")
+    rep.p(f"время до t_gel = {p.t_gel/3600:g} ч. h = m/ρ, ρ = {p.rho_layer:.0f} кг/м³ (плотный SiO₂).")
+    rep.p("Конфигурации: лаборатория — нагрев боковой поверхности, торцы открыты (h = "
+          f"{p.h_loss:g} Вт/(м²·К)); кернодержатель — рубашка и торцевые заглушки при уставке.")
+    hold = replace(p, heating="holder")
+    wh = wall_profile_analysis(hold, _block_cached(hold, 0.0, 200), dTs20)
+    rep.p(f"Кернодержатель без протока: T_w(середина) = {wh['T_mid']-273.15:.2f} °C, неоднородность "
+          f"{wh['dT_axial_channel']:.3f} K, торцевых зон нет.")
+    rows = []
+    prof_cols = {}
+    vis_rows = []
+    for R in (250e-6, 500e-6):
+        for cfg, lab in THERMAL_CONFIGS:
+            pc = replace(p, R=R, heating=cfg)
+            ksR = float(pc.ks()); EeR = float(e_eff(pc.E, pc.E_D, float(k_eff(ksR, R, pc.D)) / ksR))
+            waR = wall_profile_analysis(pc, _block_cached(pc, 0.0, 200), float(delta_T_star(0.2, pc.T_w, EeR)))
+            qm = q_min(pc, 0.2) / UL_MIN
+            for reg, Qv in (("проток Q_min", qm), ("проток 0,1", 0.1), ("статика", None)):
+                if Qv is None:
+                    z, mz, hz, Tz = static_deposit(pc)
+                    t_note = ""
+                else:
+                    z, mz, hz, Tz = flow_deposit(pc, Qv)
+                    t_res = p.L / (Qv * UL_MIN / (math.pi * R ** 2))
+                    t_note = "" if p.t_treat > t_res else " *"
+                st = deposit_stats(z, hz, p.L, waR["l_end_in"], waR["l_end_out"])
+                rows.append([f"{R*1e6:.0f}", "лаб." if cfg == "side" else "кернодерж.",
+                             reg + (f" ({Qv:.2g})" if Qv is not None and reg.endswith("Q_min") else "") + t_note,
+                             fmt(float(np.interp(0.5 * p.L, z, mz)) * 1e3),
+                             f"{st['h_in']*1e6:.2f} / {st['h_mid']*1e6:.2f} / {st['h_out']*1e6:.2f}",
+                             fmt(100 * st["nonuni_channel"]), fmt(100 * st["nonuni_work"])])
+                vis_rows.append({"R_um": R * 1e6, "config": cfg, "regime": reg, "Q_ul_min": Qv,
+                                 "m_mid_g_m2": float(np.interp(0.5 * p.L, z, mz)) * 1e3,
+                                 **{k: (v * 1e6 if k.startswith("h_") else v) for k, v in st.items()}})
+                prof_cols[f"h_um_R{R*1e6:.0f}_{cfg}_{reg.replace(' ', '_').replace(',', '.')}"] = hz * 1e6
+                prof_cols.setdefault("z_mm", z * 1e3)
+    rep.table(["R, мкм", "конфигурация", "режим (Q, мкл/мин)", "m(середина), г/м²",
+               "h вход / середина / выход, мкм", "1−h_min/h_max канал, %", "то же раб. участок, %"], rows)
+    rep.p(f"* t = {p.t_treat/3600:g} ч меньше времени пребывания L/ū: золь за это время не доходит до выхода,")
+    rep.p("  и квазистационарная оценка у выхода завышена (для таких строк форма — предельная).")
+    rep.p("Рабочий участок — без торцевых зон |T_w − T_w(середина)| > ΔT*(20 %); в кернодержателе это весь канал.")
+    rep.p("Проток считается при неизменном просвете (h ≪ R); при h, сравнимом с R, — см. задачу о сужении (7.6).")
+    write_csv(os.path.join(out, "deposit_summary.csv"),
+              list(vis_rows[0].keys()), [list(r.values()) for r in vis_rows])
+    keys = ["z_mm"] + [k for k in prof_cols if k != "z_mm"]
+    write_csv(os.path.join(out, "deposit_profiles.csv"), keys,
+              [[float(prof_cols[k][i]) for k in keys] for i in range(len(prof_cols["z_mm"]))])
+    rep.data["deposit"] = vis_rows
+    if not args.no_figs:
+        files = []
+        Qm_p = q_min(p, 0.2) / UL_MIN
+        for cfg, lab in THERMAL_CONFIGS:
+            nm, K = figV1_section(p, cfg, lab, figdir, Qm_p)
+            files.append((nm, f"рис. 1: продольный разрез r–z, {lab}, слой ×{K}"))
+        files.append((figV2_block_T(p, figdir, Qm_p), "рис. 2: поле T(r, z) в блоке, две конфигурации"))
+        files.append((figV3_h(p, figdir)[0], "рис. 3: h(z) и m(z), R = 250 и 500 мкм, обе конфигурации"))
+        files.append((figV4_rings(p, figdir), "рис. 4: поперечные сечения вход / середина / выход"))
+        mbQ = moving_boundary(pmb, "Q", 50e-6, 0.5, R_stop_frac=0.4, Nz=Nmb, record_every=5)
+        mbP = moving_boundary(pmb, "dp", 50e-6, 0.5, R_stop_frac=0.4, Nz=Nmb, record_every=5)
+        gif = animV5_growth(p, figdir, mbQ, mbP)
+        rep.p("")
+        rep.p(f"Рисунки и анимация раздела 8 сохранены в {figdir}/:")
+        for nm, d in files:
+            rep.p(f"  {nm}.png, {nm}.pdf — {d}")
+        rep.p(f"  {gif} — рис. 5: анимация роста слоя (проток) и сужения при Q = const и Δp = const")
+    rep.p(f"Таблицы: {out}/deposit_summary.csv, {out}/deposit_profiles.csv")
+
     # ---------------- рисунки ----------------
     if not args.no_figs:
         fig2_times(p, figdir)
@@ -1680,6 +2183,12 @@ FIGURES = [
     ("fig7_static_narrowing", "Рис. 7. Статика, циклы сужения, профили R(z)"),
     ("figS_wall_temperature", "T_w(z) в блоке: торцевые зоны и провал от притока золя"),
     ("figS_checks_Sh_Leveque", "Проверка: Sh(Bi) и решение Левека"),
+    ("figV1_section_side", "Разд. 8, рис. 1. Продольный разрез: c/c₀ и слой, лаборатория"),
+    ("figV1_section_holder", "Разд. 8, рис. 1. Продольный разрез: c/c₀ и слой, кернодержатель"),
+    ("figV2_block_temperature", "Разд. 8, рис. 2. Поле T(r, z) в блоке, две конфигурации"),
+    ("figV3_h_profiles", "Разд. 8, рис. 3. h(z) и m(z) вдоль канала"),
+    ("figV4_cross_sections", "Разд. 8, рис. 4. Поперечные сечения: кольцо осадка в масштабе"),
+    ("anim_layer_growth", "Разд. 8, рис. 5. Анимация: рост слоя и сужение канала (GIF)"),
 ]
 
 
