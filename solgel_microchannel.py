@@ -11,14 +11,15 @@
      оценка скорости естественной конвекции.
   4. Проточный режим: задача Гретца с условием третьего рода (точное Sh(Bi)),
      k_эф, Da_эф, δ, Q_min.
-  5. Тепловое управление: E_эф, ΔT*, ослабление неоднородностей стенкой,
-     торцевые зоны, избирательность локального нагрева.
+  5. Тепловое управление: E_эф, ΔT* = −ln(1−δ*)R_gT²/E_эф, стационарное поле
+     в фотополимерном блоке Ø30 × 30 мм → T_w(z), торцевые зоны, провал T_w от
+     притока холодного золя, совместный критерий, избирательность нагрева.
   6. Статика: m_max, m(t)/m_max, Da_ст; закон сужения R_n, перепад давления,
      сопротивление пережима, проницаемость (пучок капилляров, Козени — Кармен).
   7. Численная проверка:
      (1) Sh = 3,66 / 4,36 и решение Левека у входа;
      (2) c̄(z), J(z): маршевое численное решение против аналитики;
-     (3) квазиизотермичность: прогрев порции золя в канале с нагретой стенкой;
+     (3) квазиизотермичность: заливка холодного золя в прогретый блок (толстая стенка);
      (4) сеточная сходимость и материальный баланс;
      (5) чувствительность Q_min и ΔT* к k_s, E, D;
      (6) задача с подвижной границей R(z,t) при Q = const и Δp = const.
@@ -79,10 +80,16 @@ SH_NEUMANN = 4.3636        # Sh_D, постоянный поток (Bi → 0)
 class Params:
     # геометрия и режим
     R: float = 250e-6            # радиус канала, м
-    L: float = 25e-3             # длина канала, м
-    delta_w: float = 1e-3        # толщина стенки, м (уточнить по образцам)
-    T_w: float = 333.15          # температура стенки, К
+    L: float = 25e-3             # длина канала, м — ЕДИНСТВЕННОЕ место, где задаётся L
+    T_w: float = 333.15          # уставка нагревателя, К (принимается в кинетике)
     Q_ul_min: float = 1.0        # расход, мкл/мин
+    # фотополимерный блок: цилиндр Ø30 × 30 мм, канал по оси
+    R_block: float = 15e-3       # радиус блока, м
+    H_block: float = 30e-3       # высота блока, м (канал длиной L — по центру)
+    T_air: float = 293.15        # температура воздуха, К
+    T_in: float = 293.15         # температура поступающего золя, К
+    heating: str = "side"        # "side" — боковая поверхность; "bottom" — торец на плитке
+    orientation: str = "vertical"  # "vertical" | "horizontal" — ориентация оси канала
     # перенос в золе (основа — этанол)
     D: float = 1e-9              # коэффициент диффузии, м²/с
     lam_sol: float = 0.17        # теплопроводность золя, Вт/(м·К)
@@ -131,6 +138,11 @@ class Params:
     def c0(self) -> float:
         return c0_from_composition(self.composition)
 
+    @property
+    def z_ch0(self) -> float:
+        """Координата начала канала (входа) от нижнего торца блока."""
+        return 0.5 * (self.H_block - self.L)
+
     def ks(self, T: float | np.ndarray | None = None):
         T = self.T_w if T is None else T
         return self.ks_ref * np.exp(-self.E / R_GAS * (1.0 / T - 1.0 / self.T_ref))
@@ -167,7 +179,7 @@ def time_scales(p: Params, Q_range=(0.1, 2.0)) -> dict:
     u_lo = Q_range[0] * UL_MIN / (math.pi * p.R ** 2)
     return {
         "t_heat_sol": p.R ** 2 / p.a_sol,
-        "t_heat_wall": p.delta_w ** 2 / p.a_wall,
+        "t_heat_block": p.R_block ** 2 / p.a_wall,
         "t_diff_radial": p.R ** 2 / p.D,
         "t_res_min": p.L / u_hi,
         "t_res_max": p.L / u_lo,
@@ -185,14 +197,180 @@ def entry_length(Q: float, D: float) -> float:
     return 0.2 * Q / (math.pi * D)
 
 
-def natural_convection_velocity(p: Params, grad_T: float) -> float:
-    """Оценка скорости естественной конвекции в ГОРИЗОНТАЛЬНОМ канале,
-    вызванной осевым градиентом температуры стенки G = dT_w/dz
-    (течение Бириха в слое толщиной d = 2R с твёрдыми стенками):
-        u_max = g β G d³ / (72·√3·ν).
-    Для круглой трубы — оценка по порядку величины."""
-    d = 2.0 * p.R
-    return G_ACC * p.beta_sol * grad_T * d ** 3 / (72.0 * math.sqrt(3.0) * p.nu)
+RA_C_CONDUCTING = 215.6    # порог для вертикальной трубы, Ra = gβGR⁴/(νa): теплопроводящие стенки
+RA_C_INSULATING = 67.9     # то же, теплоизолированные стенки
+
+
+def horizontal_pipe_velocity(p: Params, grad_T: float) -> float:
+    """Естественная конвекция в ГОРИЗОНТАЛЬНОЙ круглой трубе от осевого
+    градиента температуры G (стоксово течение, нулевой суммарный расход):
+        u(r, φ) = gβG·y·(r² − R²)/(8ν),  u_max = gβ|G|R³/(12√3·ν)."""
+    return G_ACC * p.beta_sol * abs(grad_T) * p.R ** 3 / (12.0 * math.sqrt(3.0) * p.nu)
+
+
+def vertical_rayleigh(p: Params, grad_T_unstable: float) -> float:
+    """Число Рэлея для ВЕРТИКАЛЬНОЙ трубы с осевым градиентом:
+    Ra = gβG R⁴/(ν a), G = −dT/dz > 0 (температура падает вверх — неустойчиво).
+    Конвекция возникает при Ra > Ra_c = 67,9 (изолирующие) … 215,6 (проводящие стенки)."""
+    return G_ACC * p.beta_sol * max(grad_T_unstable, 0.0) * p.R ** 4 / (p.nu * p.a_sol)
+
+
+# ---------------------------------------------------------------------------
+# Теплопроводность в блоке (осесимметричная, стационарная, с протоком золя)
+# ---------------------------------------------------------------------------
+def _block_grid(p: Params, n_in: int = 6, dr_max: float = 4e-4, Nz: int = 300):
+    dr0 = p.R / n_in
+    rf = list(np.linspace(0.0, p.R, n_in + 1))
+    dr = dr0
+    while rf[-1] < p.R_block - 1e-12:
+        dr = min(dr * 1.15, dr_max)
+        rf.append(min(rf[-1] + dr, p.R_block))
+    if rf[-1] - rf[-2] < 0.3 * dr0:          # слишком тонкая последняя ячейка
+        rf.pop(-2)
+    rf = np.array(rf)
+    zf = np.linspace(0.0, p.H_block, Nz + 1)
+    return rf, zf
+
+
+def block_temperature(p: Params, Q_ul_min: float = 0.0, Nz: int = 300, dr_max: float = 4e-4):
+    """Стационарная осесимметричная теплопроводность в фотополимерном
+    цилиндре R_block × H_block с каналом радиусом R по оси (сквозное отверстие,
+    заполненное золем). Проток Q (вверх, от z = 0) с температурой входа T_in
+    учитывается конвективным членом в ячейках золя (схема против потока).
+    Граничные условия:
+      heating = "side":   r = R_block — T = T_w (уставка); торцы — теплоотдача h в воздух;
+      heating = "bottom": z = 0 — T = T_w; боковая поверхность и верхний торец — h.
+    Возвращает z (центры ячеек), T_w(z) на стенке канала r = R и поле T(r, z)."""
+    rf, zf = _block_grid(p, dr_max=dr_max, Nz=Nz)
+    rc = 0.5 * (rf[1:] + rf[:-1])
+    zc = 0.5 * (zf[1:] + zf[:-1]); dz = np.diff(zf)
+    nr, nz = len(rc), len(zc)
+    n_in = int(np.searchsorted(rc, p.R))            # ячейки золя: i < n_in
+    lam = np.where(rc < p.R, p.lam_sol, p.lam_wall)
+    area_z = np.pi * (rf[1:] ** 2 - rf[:-1] ** 2)   # площадь торцевой грани ячейки
+    idx = lambda i, j: j * nr + i
+    rows, cols, vals = [], [], []
+    b = np.zeros(nr * nz)
+    diag = np.zeros(nr * nz)
+
+    def link(k1, k2, G):
+        rows.extend([k1, k2]); cols.extend([k2, k1]); vals.extend([G, G])
+        diag[k1] -= G; diag[k2] -= G
+
+    # радиальные связи
+    for i in range(nr - 1):
+        res = (rf[i + 1] - rc[i]) / lam[i] + (rc[i + 1] - rf[i + 1]) / lam[i + 1]
+        Gr = 2.0 * np.pi * rf[i + 1] * dz / res
+        for j in range(nz):
+            link(idx(i, j), idx(i + 1, j), Gr[j])
+    # осевые связи
+    for j in range(nz - 1):
+        Gz = area_z * lam / (0.5 * (dz[j] + dz[j + 1]))
+        for i in range(nr):
+            link(idx(i, j), idx(i, j + 1), Gz[i])
+
+    def to_ambient(k, cond_half, area, T_amb, dirichlet):
+        # cond_half — λ/расстояние до грани; если Дирихле — только кондуктивная часть
+        if dirichlet:
+            G = area * cond_half
+        else:
+            G = area / (1.0 / cond_half + 1.0 / p.h_loss)
+        diag[k] -= G; b[k] -= G * T_amb
+
+    side_dir = p.heating == "side"
+    bot_dir = p.heating == "bottom"
+    for j in range(nz):                               # боковая поверхность
+        k = idx(nr - 1, j)
+        to_ambient(k, lam[-1] / (rf[-1] - rc[-1]), 2 * np.pi * rf[-1] * dz[j],
+                   p.T_w if side_dir else p.T_air, side_dir)
+    for i in range(nr):                               # торцы
+        to_ambient(idx(i, 0), lam[i] / (0.5 * dz[0]), area_z[i],
+                   p.T_w if bot_dir else p.T_air, bot_dir)
+        to_ambient(idx(i, nz - 1), lam[i] / (0.5 * dz[-1]), area_z[i], p.T_air, False)
+
+    # проток в канале: ρc·Q_i·(T_{j-1} − T_j), вход при z = 0 с T_in
+    if Q_ul_min > 0:
+        Q = Q_ul_min * UL_MIN
+        u = Q / (np.pi * p.R ** 2)
+        F = lambda r: 2 * np.pi * u * (r ** 2 - r ** 4 / (2 * p.R ** 2))   # ∫u·2πr dr
+        Qi = F(np.minimum(rf[1:n_in + 1], p.R)) - F(rf[:n_in])
+        for i in range(n_in):
+            m = p.rhoc_sol * Qi[i]
+            for j in range(nz):
+                k = idx(i, j)
+                diag[k] -= m
+                if j == 0:
+                    b[k] -= m * p.T_in
+                else:
+                    rows.append(k); cols.append(idx(i, j - 1)); vals.append(m)
+
+    rows.extend(range(nr * nz)); cols.extend(range(nr * nz)); vals.extend(diag)
+    A = sparse.csr_matrix((vals, (rows, cols)), shape=(nr * nz, nr * nz))
+    from scipy.sparse.linalg import spsolve
+    T = spsolve(A.tocsc(), b).reshape(nz, nr)
+    # температура на стенке канала r = R (интерфейс ячеек n_in-1 | n_in)
+    i1, i2 = n_in - 1, n_in
+    w1 = lam[i1] / (rf[n_in] - rc[i1]); w2 = lam[i2] / (rc[i2] - rf[n_in])
+    Tw = (w1 * T[:, i1] + w2 * T[:, i2]) / (w1 + w2)
+    return {"z": zc, "Tw": Tw, "T": T, "r": rc, "Q_ul_min": Q_ul_min}
+
+
+def wall_profile_analysis(p: Params, blk: dict, dT_star: float) -> dict:
+    """Характеристики T_w(z) на канале [z_ch0, z_ch0 + L]: отклонение от уставки,
+    осевая неоднородность, торцевые зоны |T_w − T_w(середина)| > ΔT*,
+    рабочий участок и градиенты."""
+    z, Tw = blk["z"], blk["Tw"]
+    z0 = p.z_ch0
+    zc = np.linspace(0.0, p.L, 1001)                # координата от входа канала
+    Tc = np.interp(zc + z0, z, Tw)
+    T_mid = float(np.interp(0.5 * p.L, zc, Tc))
+    dev = np.abs(Tc - T_mid)
+    ok = dev <= dT_star
+    if ok.any():
+        l_in = float(zc[np.argmax(ok)])
+        l_out = float(p.L - zc[len(ok) - 1 - np.argmax(ok[::-1])])
+    else:
+        l_in = l_out = 0.5 * p.L
+    work = (zc >= l_in) & (zc <= p.L - l_out)
+    dTdz = np.gradient(Tc, zc)
+    return {
+        "T_mid": T_mid, "dev_from_set": p.T_w - T_mid,
+        "T_in_end": float(Tc[0]), "T_out_end": float(Tc[-1]),
+        "dT_axial_channel": float(Tc.max() - Tc.min()),
+        "dT_axial_work": float(Tc[work].max() - Tc[work].min()) if work.any() else float("nan"),
+        "l_end_in": l_in, "l_end_out": l_out, "L_work": p.L - l_in - l_out,
+        "grad_max_channel": float(np.abs(dTdz).max()),
+        "grad_max_work": float(np.abs(dTdz[work]).max()) if work.any() else float("nan"),
+        "grad_unstable_channel": float(max((-dTdz).max(), 0.0)),   # T падает вверх (z вверх)
+        "grad_unstable_work": float(max((-dTdz[work]).max(), 0.0)) if work.any() else 0.0,
+        "zc": zc, "Tc": Tc,
+    }
+
+
+def block_side_analytic(p: Params, r: float, z: float, n: int = 400) -> float:
+    """Аналитический ряд для блока без канала при нагреве боковой поверхности:
+    T = T_w + Σ A_n J0(λ_n r/R_б)·ch(λ_n(z − H/2)/R_б), торцы — теплоотдача h.
+    Используется для проверки численного решения."""
+    ln = jn_zeros(0, n)
+    a = ln * p.H_block / (2 * p.R_block)
+    zz = ln * abs(z - p.H_block / 2) / p.R_block
+    ch_ratio = np.exp(zz - a) * (1 + np.exp(-2 * zz)) / (1 + np.exp(-2 * a))
+    den = p.lam_wall * ln / p.R_block * np.tanh(a) + p.h_loss
+    A = -p.h_loss * (p.T_w - p.T_air) * 2 / (ln * j1(ln)) / den
+    return float(p.T_w + np.sum(A * ch_ratio * j0(ln * r / p.R_block)))
+
+
+def block_warmup_time(p: Params, tol: float = 0.1, T0: float | None = None, n: int = 40) -> dict:
+    """Прогрев блока с боковой поверхности (бесконечный цилиндр радиуса R_block)
+    от T0 до уставки: время, когда ось отстаёт меньше чем на tol."""
+    T0 = p.T_air if T0 is None else T0
+    lam = jn_zeros(0, n)
+    coef = 2.0 / (lam * j1(lam))
+    th0 = abs(p.T_w - T0)
+    f = lambda t: th0 * abs(np.sum(coef * np.exp(-lam ** 2 * p.a_wall * t / p.R_block ** 2))) - tol
+    tau = p.R_block ** 2 / p.a_wall
+    t = brentq(f, 1e-3 * tau, 50 * tau)
+    return {"scale": tau, "time_constant": tau / lam[0] ** 2, "t_tol": t}
 
 
 # ---------------------------------------------------------------------------
@@ -297,37 +475,55 @@ def e_eff(E, E_D, keff_over_ks):
     return r * E + (1.0 - r) * E_D
 
 
-def delta_T_star(delta_star, T_w, E_eff, exact=False):
-    """ΔT* = δ* R T²/E_эф (как в плане). exact=True: -ln(1-δ*) R T²/E_эф
-    (точная обратная к δ = 1 - exp(-E ΔT / R T²))."""
-    f = da_limit(delta_star) if exact else delta_star
-    return f * R_GAS * T_w ** 2 / np.asarray(E_eff)
+def delta_T_star(delta_star, T_w, E_eff):
+    """ΔT* = −ln(1−δ*)·R_g T²/E_эф — обратная к δ = 1 − exp(−E_эф ΔT/(R_g T²))."""
+    return da_limit(delta_star) * R_GAS * T_w ** 2 / np.asarray(E_eff)
 
 
-def wall_attenuation(wavelength, delta_w):
-    """Коэффициент ослабления гармонической неоднородности нагревателя стенкой
-    (предел слабой связи с золем)."""
-    return 1.0 / np.cosh(2.0 * np.pi * delta_w / np.asarray(wavelength))
+def combined_lhs(Da, E_eff, dT, T_w):
+    """Левая часть совместного критерия: Da_эф + E_эф·ΔT/(R_g·T_w²) ≤ −ln(1−δ*)."""
+    return Da + E_eff * dT / (R_GAS * T_w ** 2)
 
 
-def fin_length(p: Params) -> float:
-    """Длина теплового ребра стенки: l_f = sqrt(λ_w δ_w / h)."""
-    return math.sqrt(p.lam_wall * p.delta_w / p.h_loss)
-
-
-def end_zone_length(p: Params, dT_end: float, dT_star: float) -> float:
-    """Протяжённость торцевой зоны, где отклонение T_w > ΔT*,
-    при экспоненциальном затухании торцевого провала dT_end."""
-    if dT_end <= dT_star:
-        return 0.0
-    return fin_length(p) * math.log(dT_end / dT_star)
+def q_min_combined(p: Params, delta_star: float, dT: float) -> float:
+    """Q_min по совместному критерию (обеднение + осевая неоднородность T_w).
+    inf — если тепловая неоднородность сама по себе превышает допуск."""
+    ks = float(p.ks())
+    ke = float(k_eff(ks, p.R, p.D))
+    Ee = float(e_eff(p.E, p.E_D, ke / ks))
+    room = da_limit(delta_star) - Ee * dT / (R_GAS * p.T_w ** 2)
+    if room <= 0:
+        return math.inf
+    return (2.0 * math.pi * p.R * p.L * ke + math.pi * p.R ** 2 * p.L * p.k_v) / room
 
 
 def selectivity(E, dT, T):
-    """Ускорение роста в перегретом пятне: (линеаризованное, точное)."""
-    lin = math.exp(E * dT / (R_GAS * T ** 2))
-    ex = math.exp(E / R_GAS * (1.0 / T - 1.0 / (T + dT)))
-    return lin, ex
+    """Ускорение роста в перегретом на ΔT пятне (точный Аррениус):
+    exp[E/R_g·(1/T − 1/(T+ΔT))]."""
+    return math.exp(E / R_GAS * (1.0 / T - 1.0 / (T + dT)))
+
+
+def deposition_profile(p: Params, Tw_of_z=None, Nz: int = 1001):
+    """J(z)/J_ref вдоль канала с обеднением и (необязательно) профилем T_w(z):
+    dc̄/dz = −(2k_эф(T_w(z))/(Rū) + k_v/ū)·c̄,  J = k_эф(T_w(z))·c̄.
+    Tw_of_z — функция z (от входа канала) → T, по умолчанию T_w = const."""
+    z = np.linspace(0.0, p.L, Nz)
+    T = np.full(Nz, p.T_w) if Tw_of_z is None else Tw_of_z(z)
+    ks = p.ks(T)
+    ke = k_eff(ks, p.R, p.D)
+    u = p.u_mean
+    rate = 2.0 * ke / (p.R * u) + p.k_v / u
+    integ = np.concatenate([[0.0], np.cumsum(0.5 * (rate[1:] + rate[:-1]) * np.diff(z))])
+    cb = np.exp(-integ)
+    return z, ke * cb
+
+
+def delta_working(z, J, z1, z2):
+    """Неравномерность на рабочем участке [z1, z2]:
+    δ = 1 − J(z2)/J(z1) и δ_max = 1 − min J / max J."""
+    m = (z >= z1 - 1e-12) & (z <= z2 + 1e-12)
+    Jw = J[m]
+    return 1.0 - float(np.interp(z2, z, J) / np.interp(z1, z, J)), 1.0 - Jw.min() / Jw.max()
 
 
 # ---------------------------------------------------------------------------
@@ -380,6 +576,14 @@ def static_first_mode_fraction(Da_st, kappa=0.0):
 
 def narrowing_epsilon(f, c0, rho_layer):
     return f * c0 * M_SIO2 / (2.0 * rho_layer)
+
+
+CRACK_THICKNESS = 1e-6     # порог растрескивания плотной плёнки SiO₂ за один цикл, м (лит.)
+
+
+def fill_thickness(f, c0, rho_layer, R):
+    """Толщина плотного SiO₂ за один залив: h₁ = f·c₀·M·R/(2ρ) = ε·R."""
+    return narrowing_epsilon(f, c0, rho_layer) * R
 
 
 def n_cycles(R0, Rf, eps):
@@ -467,25 +671,35 @@ def leveque_sh(zeta, shah=False):
     return 1.077 * x ** (-1.0 / 3.0) - (0.7 if shah else 0.0)
 
 
-def thermal_fill_check(p: Params, T0=293.15, Th=None, N_sol=60, N_wall=120, t_end=30.0):
-    """Квазиизотермичность: порция холодного золя (T0) в канале, стенка
-    предварительно прогрета до Th, внешняя граница стенки держится при Th.
-    Радиальная сопряжённая теплопроводность (конечные объёмы)."""
+def thermal_fill_check(p: Params, T0: float | None = None, Th: float | None = None,
+                       N_sol: int = 30, t_end: float = 3000.0):
+    """Квазиизотермичность: порция холодного золя (T0) заполняет канал в
+    ТОЛСТОЙ стенке — фотополимерный цилиндр до R_block, прогретый до Th;
+    граница r = R_block держится при Th. Радиальная сопряжённая
+    теплопроводность в среднем сечении (конечные объёмы, BDF).
+    Поздняя стадия — остывание вокруг «линейного стока»: ΔT ≈ E'/(4πλ_w t)."""
+    T0 = p.T_in if T0 is None else T0
     Th = p.T_w if Th is None else Th
-    R, dw = p.R, p.delta_w
-    r_f = np.concatenate([np.linspace(0, R, N_sol + 1), np.linspace(R, R + dw, N_wall + 1)[1:]])
+    R = p.R
+    r_in = np.linspace(0, R, N_sol + 1)
+    dr0 = R / N_sol
+    r_out = [R]
+    dr = dr0
+    while r_out[-1] < p.R_block - 1e-12:
+        dr = min(dr * 1.08, 2e-4)
+        r_out.append(min(r_out[-1] + dr, p.R_block))
+    r_f = np.concatenate([r_in, np.array(r_out[1:])])
     rc = 0.5 * (r_f[1:] + r_f[:-1])
     dr = np.diff(r_f)
     n = len(rc)
     lam = np.where(rc < R, p.lam_sol, p.lam_wall)
     rhoc = np.where(rc < R, p.rhoc_sol, p.rhoc_wall)
     vol = rc * dr
-    # проводимости граней (гармоническое среднее)
     G = np.zeros(n + 1)
     for k in range(1, n):
         res = (rc[k] - r_f[k]) / lam[k] + (r_f[k] - rc[k - 1]) / lam[k - 1]
         G[k] = r_f[k] / res
-    G[n] = r_f[n] / ((r_f[n] - rc[-1]) / lam[-1])  # внешняя граница, T = Th
+    G[n] = r_f[n] / ((r_f[n] - rc[-1]) / lam[-1])
     rows, cols, vals = [], [], []
     for k in range(n):
         d = 0.0
@@ -497,29 +711,45 @@ def thermal_fill_check(p: Params, T0=293.15, Th=None, N_sol=60, N_wall=120, t_en
             d -= G[n]
         rows.append(k); cols.append(k); vals.append(d)
     A = sparse.diags(1.0 / (rhoc * vol)) @ sparse.csr_matrix((vals, (rows, cols)), shape=(n, n))
-    b = np.zeros(n); b[-1] = G[n] * Th / (rhoc[-1] * vol[-1])
+    bvec = np.zeros(n); bvec[-1] = G[n] * Th / (rhoc[-1] * vol[-1])
     y0 = np.where(rc < R, T0, Th)
-    t_eval = np.concatenate([[0.0], np.geomspace(1e-3, t_end, 300)])
-    sol = solve_ivp(lambda t, y: A @ y + b, (0, t_end), y0, method="BDF", jac=A,
-                    t_eval=t_eval, rtol=1e-8, atol=1e-8)
-    i_wall = np.searchsorted(rc, R)               # первая ячейка стенки
-    T_center = sol.y[0]
-    T_inner_wall = sol.y[i_wall]
+    t_eval = np.concatenate([[0.0], np.geomspace(1e-3, t_end, 400)])
+    sol = solve_ivp(lambda t, y: A @ y + bvec, (0, t_end), y0, method="BDF", jac=A,
+                    t_eval=t_eval, rtol=1e-8, atol=1e-9)
+    i_wall = int(np.searchsorted(rc, R))
     dev = np.abs(Th - sol.y[:i_wall]).max(axis=0)
-    return {"t": sol.t, "T_center": T_center, "T_inner_wall": T_inner_wall,
-            "max_dev_sol": dev}
+    below = dev < 0.1
+    t01 = float(sol.t[np.argmax(below)]) if below.any() else math.inf
+    E_line = math.pi * R ** 2 * p.rhoc_sol * abs(Th - T0)          # Дж/м
+    return {"t": sol.t, "max_dev_sol": dev, "T_inner_wall": sol.y[i_wall],
+            "t_below_0p1": t01, "E_line": E_line,
+            "line_sink_t01": E_line / (4 * math.pi * p.lam_wall * 0.1)}
+
+
+def _mb_state(p: Params, R, z, mode, Q0, dp0):
+    if mode == "Q":
+        Q = Q0
+    else:
+        Q = dp0 / (8.0 * p.mu / math.pi * _trapz(1.0 / R ** 4, z))
+    u = Q / (math.pi * R ** 2)
+    ke = k_eff(p.ks(), R, p.D)
+    rate = 2.0 * ke / (R * u) + p.k_v / u
+    integ = np.concatenate([[0.0], np.cumsum(0.5 * (rate[1:] + rate[:-1]) * np.diff(z))])
+    cb = p.c0 * np.exp(-integ)
+    return Q, ke, cb
 
 
 def moving_boundary(p: Params, mode: str, R0: float, Da0: float, R_stop_frac=0.4,
-                    Nz=300, snapshots=(1.0, 0.8, 0.6, 0.4), t_max=1e7):
+                    Nz=300, snapshots=(1.0, 0.8, 0.6, 0.4), t_max=1e7, cfl=0.002):
     """Квазистационарное сужение R(z,t):
         dR/dt = -(M/ρ_сл) k_эф(R) c̄(z,t),
         dc̄/dz = -(2 k_эф/(R ū) + k_v/ū) c̄,  ū = Q/(πR²).
     mode = 'Q' (Q = const) или 'dp' (Δp = const). Начальный расход задаётся
-    так, чтобы Da_эф(t=0) = Da0. Возвращает профили R(z) в моменты, когда
-    min R/R0 достигает значений snapshots."""
+    так, чтобы Da_эф(t=0) = Da0 (длина канала — p.L). Шаг: dt = cfl·min R/max|dR/dt|.
+    Снимки — в моменты, когда min R/R0 проходит значения snapshots
+    (линейная интерполяция между шагами). Для каждого снимка:
+    t, R(z), Q/Q0, J(L)/J(0) (мгновенная) — накопленная неравномерность — по R(z)."""
     z = np.linspace(0.0, p.L, Nz)
-    dz = z[1] - z[0]
     R = np.full(Nz, R0)
     ke0 = float(k_eff(p.ks(), R0, p.D))
     Q0 = 2.0 * math.pi * R0 * p.L * ke0 / Da0
@@ -527,31 +757,28 @@ def moving_boundary(p: Params, mode: str, R0: float, Da0: float, R_stop_frac=0.4
     t = 0.0
     snaps = {}
     targets = sorted(snapshots, reverse=True)
-    history = []
-    c0 = p.c0
+    R_prev, t_prev, frac_prev = R.copy(), 0.0, 1.0
+    nsteps = 0
     while True:
-        if mode == "Q":
-            Q = Q0
-        else:
-            resist = 8.0 * p.mu / math.pi * _trapz(1.0 / R ** 4, z)
-            Q = dp0 / resist
-        u = Q / (math.pi * R ** 2)
-        ke = k_eff(p.ks(), R, p.D)
-        rate = 2.0 * ke / (R * u) + p.k_v / u
-        # интеграл от 0 до z (трапеции)
-        integ = np.concatenate([[0.0], np.cumsum(0.5 * (rate[1:] + rate[:-1]) * dz)])
-        cb = c0 * np.exp(-integ)
-        dRdt = -(M_SIO2 / p.rho_layer) * ke * cb
         frac = R.min() / R0
-        history.append((t, frac, (R.max() - R.min()) / R0, Q / Q0))
         while targets and frac <= targets[0] + 1e-12:
-            snaps[targets.pop(0)] = (t, R.copy(), Q / Q0, float(ke[-1] * cb[-1] / (ke[0] * cb[0])))
+            tg = targets.pop(0)
+            w = 1.0 if frac_prev == frac else (frac_prev - tg) / (frac_prev - frac)
+            w = min(max(w, 0.0), 1.0)
+            Rs = R_prev + w * (R - R_prev)
+            ts = t_prev + w * (t - t_prev)
+            Qs, kes, cbs = _mb_state(p, Rs, z, mode, Q0, dp0)
+            snaps[tg] = (ts, Rs, Qs / Q0, float(kes[-1] * cbs[-1] / (kes[0] * cbs[0])))
         if frac <= R_stop_frac or t > t_max or not targets:
             break
-        dt = 0.002 * R.min() / np.abs(dRdt).max()
+        Q, ke, cb = _mb_state(p, R, z, mode, Q0, dp0)
+        dRdt = -(M_SIO2 / p.rho_layer) * ke * cb
+        dt = cfl * R.min() / np.abs(dRdt).max()
+        R_prev, t_prev, frac_prev = R.copy(), t, frac
         R = R + dRdt * dt
         t += dt
-    return {"z": z, "snaps": snaps, "history": np.array(history), "Q0": Q0, "dp0": dp0}
+        nsteps += 1
+    return {"z": z, "snaps": snaps, "Q0": Q0, "dp0": dp0, "nsteps": nsteps}
 
 
 # ---------------------------------------------------------------------------
@@ -631,13 +858,13 @@ def _save(fig, outdir, name):
 def fig2_times(p, outdir):
     plt = _style()
     fig, ax = plt.subplots(figsize=(3.8, 2.7))
-    labels = ["Прогрев золя, R²/a", "Прогрев стенки, δ$_w$²/a$_w$",
+    labels = ["Прогрев золя, R²/a", "Прогрев блока, R$_{блок}^2$/a$_w$",
               "Радиальная диффузия, R²/D", "Пребывание, L/ū", "Гелеобразование\n(лит., иллюстр.)"]
     ypos = np.arange(5)[::-1]
     for k, (R, mk) in enumerate(((250e-6, "o"), (500e-6, "s"))):
         ts = time_scales(replace(p, R=R))
         y = ypos + (0.14 if k == 0 else -0.14)
-        pts = [ts["t_heat_sol"], ts["t_heat_wall"], ts["t_diff_radial"]]
+        pts = [ts["t_heat_sol"], ts["t_heat_block"], ts["t_diff_radial"]]
         ax.plot(pts, y[:3], mk, color=C[k], ms=6, label=f"R = {R*1e6:.0f} мкм",
                 mec="white", mew=0.8)
         ax.plot([ts["t_res_min"], ts["t_res_max"]], [y[3]] * 2, "-", color=C[k], lw=2)
@@ -784,6 +1011,43 @@ def res_R0(res):
     return res["snaps"][1.0][1][0]
 
 
+def figS_wall(p, blk0, wa, dips, dTs, outdir):
+    """T_w(z) по высоте блока: канал, торцевые зоны, провал от притока золя."""
+    plt = _style()
+    fig, axs = plt.subplots(1, 2, figsize=(7.0, 2.6))
+    z = blk0["z"] * 1e3
+    ax = axs[0]
+    z0, z1 = p.z_ch0 * 1e3, (p.z_ch0 + p.L) * 1e3
+    Tm = wa["T_mid"] - 273.15
+    ax.axvspan(z0, z0 + wa["l_end_in"] * 1e3, color=C[1], alpha=0.12, lw=0)
+    ax.axvspan(z1 - wa["l_end_out"] * 1e3, z1, color=C[1], alpha=0.12, lw=0)
+    ax.axhspan(Tm - dTs, Tm + dTs, color=C[0], alpha=0.10, lw=0)
+    ax.plot(z, blk0["Tw"] - 273.15, color=C[0], label="T$_w$(z), Q = 0")
+    ax.axhline(p.T_w - 273.15, color=INK2, ls=":", lw=0.9)
+    ax.text(z[0] + 0.3, p.T_w - 273.15 + 0.15, "уставка", fontsize=7, color=INK2, va="bottom")
+    for x in (z0, z1):
+        ax.axvline(x, color=INK2, lw=0.6, ls="--")
+    ax.text(0.5 * (z0 + z1), Tm - dTs - 0.2, f"±ΔT* = {dTs:.1f} K", fontsize=7, color=INK2,
+            ha="center", va="top")
+    ax.set_xlabel("z от нижнего торца, мм")
+    ax.set_ylabel("T на стенке канала, °C")
+    ax.set_title("Канал (пунктир), торцевые зоны (заливка)", loc="left", fontsize=7)
+    ax = axs[1]
+    for k, Qv in enumerate(sorted(dips)):
+        if Qv not in (0.1, 1.0, 2.0):
+            continue
+        ax.plot(z, dips[Qv], color=C[[0.1, 1.0, 2.0].index(Qv)], label=f"Q = {Qv:g} мкл/мин")
+    for x in (z0, z1):
+        ax.axvline(x, color=INK2, lw=0.6, ls="--")
+    ax.axhline(0, color=INK2, lw=0.6)
+    ax.set_xlabel("z от нижнего торца, мм")
+    ax.set_ylabel("T$_w$(Q=0) − T$_w$(Q), K")
+    ax.set_title("> 0 — охлаждение притоком, < 0 — подогрев выше по потоку", loc="left", fontsize=7)
+    ax.legend(fontsize=7)
+    _save(fig, outdir, "figS_wall_temperature")
+    plt.close(fig)
+
+
 def figS_checks(sh_rows, lev, outdir):
     plt = _style()
     fig, axs = plt.subplots(1, 2, figsize=(7.0, 2.5))
@@ -833,19 +1097,39 @@ def main(argv=None, params: Params | None = None):
     rep.p(f"k_s(T_w) = {float(p.ks()):.2e} м/с, E = {p.E/1e3:.0f} кДж/моль, D = {p.D:.1e} м²/с")
     rep.data["c0_mol_L"] = c0 / 1e3
 
+    # ---------------- температура стенки канала (используется в разделах 3–5) ----------------
+    Nz_blk = 150 if args.quick else 300
+    ks_c = float(p.ks()); ke_c = float(k_eff(ks_c, p.R, p.D))
+    Ee_c = float(e_eff(p.E, p.E_D, ke_c / ks_c))
+    dTs20 = float(delta_T_star(0.2, p.T_w, Ee_c))
+    blk0 = block_temperature(p, 0.0, Nz=Nz_blk)
+    wa = wall_profile_analysis(p, blk0, dTs20)
+    heat_name = {"side": "боковая поверхность при уставке", "bottom": "нижний торец на плитке"}[p.heating]
+    rep.p(f"Блок: цилиндр Ø{2*p.R_block*1e3:.0f} × {p.H_block*1e3:.0f} мм, λ_w = {p.lam_wall} Вт/(м·К), "
+          f"h = {p.h_loss:g} Вт/(м²·К), T_возд = {p.T_air-273.15:.0f} °C")
+    rep.p(f"Нагрев: {heat_name} {p.T_w-273.15:.0f} °C; канал {p.orientation == 'vertical' and 'вертикальный' or 'горизонтальный'}, "
+          f"L = {p.L*1e3:g} мм по центру блока (вход на высоте {p.z_ch0*1e3:.1f} мм от нижнего торца)")
+    rep.data["wall"] = {k: v for k, v in wa.items() if not isinstance(v, np.ndarray)}
+
     # ---------------- раздел 3 ----------------
-    rep.h("3. Иерархия характерных времён (L = 25 мм, Q = 0,1…2 мкл/мин)")
+    rep.h(f"3. Иерархия характерных времён (L = {p.L*1e3:g} мм, Q = 0,1…2 мкл/мин)")
     rows = []
     for R in (250e-6, 500e-6):
         ts = time_scales(replace(p, R=R))
-        rows.append([f"{R*1e6:.0f}", fmt(ts["t_heat_sol"]), fmt(ts["t_heat_wall"]),
+        rows.append([f"{R*1e6:.0f}", fmt(ts["t_heat_sol"]), fmt(ts["t_heat_block"]),
                      fmt(ts["t_diff_radial"]), f"{ts['t_res_min']:.0f}–{ts['t_res_max']:.0f}",
                      f"{ts['t_gel']/3600:.1f} ч*"])
         rep.data[f"times_R{R*1e6:.0f}"] = ts
-    rep.table(["R, мкм", "R²/a, с", "δw²/aw, с", "R²/D, с", "L/ū, с", "t_gel"], rows)
+    rep.table(["R, мкм", "R²/a, с", "R_б²/a_w, с", "R²/D, с", "L/ū, с", "t_gel"], rows)
     write_csv(os.path.join(out, "times.csv"),
-              ["R_um", "t_heat_sol", "t_heat_wall", "t_diff", "t_res_min", "t_res_max"],
+              ["R_um", "t_heat_sol", "t_heat_block", "t_diff", "t_res_min", "t_res_max"],
               [[r[0], *r[1:5]] for r in rows])
+    wu = block_warmup_time(p)
+    rep.p(f"Прогрев блока с боковой поверхности от {p.T_air-273.15:.0f} °C: масштаб R_б²/a_w = {wu['scale']:.0f} с "
+          f"({wu['scale']/60:.0f} мин), постоянная R_б²/(2,405² a_w) = {wu['time_constant']:.0f} с, "
+          f"ось отстаёт < 0,1 K через {wu['t_tol']/60:.0f} мин.")
+    rep.p("Блок нужно прогревать заранее: его прогрев длиннее пребывания золя в канале.")
+    rep.data["block_warmup"] = wu
 
     rep.p("")
     rows = []
@@ -858,25 +1142,31 @@ def main(argv=None, params: Params | None = None):
     rep.table(["R, мкм", "Q, мкл/мин", "ū, мкм/с", "Pe_T = ūR/a", "L_e, мм", "L_e/L, %"], rows)
 
     rep.p("")
-    rep.p("Естественная конвекция в горизонтальном канале от осевого градиента T_w")
-    rep.p("(течение Бириха, u_max = gβG(2R)³/(72√3ν)):")
+    rep.p("Естественная конвекция от осевого градиента найденного T_w(z) (z — вверх):")
+    rep.p(f"  max|dT_w/dz|: канал {wa['grad_max_channel']:.0f} К/м, рабочий участок {wa['grad_max_work']:.0f} К/м; "
+          f"неустойчивый (T падает вверх): канал {wa['grad_unstable_channel']:.0f}, "
+          f"рабочий участок {wa['grad_unstable_work']:.0f} К/м")
     rows = []
-    lf = fin_length(p)
-    grads = (("ΔT*=3 K на L", 3.0 / p.L), ("торец 5 K на l_f", 5.0 / lf))
     nc_rows = []
     for R in (250e-6, 500e-6):
         pp = replace(p, R=R)
-        for name, G_ in grads:
-            u_nc = natural_convection_velocity(pp, G_)
-            u01 = replace(pp, Q_ul_min=0.1).u_mean
-            rows.append([f"{R*1e6:.0f}", name, fmt(G_), fmt(u_nc * 1e6), fmt(p.D / R * 1e6),
-                         fmt(u01 * 1e6), fmt(u_nc / u01)])
-            nc_rows.append([R, G_, u_nc, p.D / R, u01])
-    rep.table(["R, мкм", "градиент", "G, К/м", "u_ест, мкм/с", "D/R, мкм/с",
-               "ū(0,1), мкм/с", "u_ест/ū"], rows)
-    rep.p("Замечание: u_ест ∝ R³. При R = 500 мкм и малом расходе конвекция от осевого")
-    rep.p("градиента сравнима с вынужденным потоком; в статике (ū = 0) она — единственное")
-    rep.p("течение. Утверждение 3 плана требует этой оценки с реальным G и ориентацией канала.")
+        Ra_ch = vertical_rayleigh(pp, wa["grad_unstable_channel"])
+        Ra_w = vertical_rayleigh(pp, wa["grad_unstable_work"])
+        uh = horizontal_pipe_velocity(pp, wa["grad_max_channel"])
+        uh_w = horizontal_pipe_velocity(pp, wa["grad_max_work"])
+        uq = q_min(pp, 0.2) / (math.pi * R ** 2)
+        u01 = 0.1 * UL_MIN / (math.pi * R ** 2)
+        rows.append([f"{R*1e6:.0f}", fmt(Ra_ch), fmt(Ra_w),
+                     "нет" if Ra_ch < RA_C_INSULATING else ("возможна" if Ra_ch < RA_C_CONDUCTING else "да"),
+                     fmt(uh * 1e6), fmt(uh_w * 1e6), fmt(uq * 1e6), fmt(uh / uq), fmt(uh / u01)])
+        nc_rows.append({"R": R, "Ra_channel": Ra_ch, "Ra_work": Ra_w, "u_horiz": uh,
+                        "u_horiz_work": uh_w, "u_Qmin": uq, "u_01": u01})
+    rep.table(["R, мкм", "Ra (канал)", "Ra (раб.)", "конвекция (верт.)", "u_гор канал, мкм/с",
+               "u_гор раб., мкм/с", "ū(Q_min), мкм/с", "u_гор/ū(Q_min)", "u_гор/ū(0,1)"], rows)
+    rep.p(f"  Вертикальный канал: Ra = gβGR⁴/(νa) сравнивается с Ra_c = {RA_C_INSULATING} (изолирующие) … "
+          f"{RA_C_CONDUCTING} (проводящие стенки).")
+    rep.p("  Горизонтальный канал: u_max = gβ|G|R³/(12√3ν) (стоксово течение в круглой трубе).")
+    rep.p(f"  Расчётная ориентация: {'вертикальный' if p.orientation == 'vertical' else 'горизонтальный'} канал.")
     rep.data["natural_convection"] = nc_rows
 
     # ---------------- раздел 4 ----------------
@@ -892,6 +1182,8 @@ def main(argv=None, params: Params | None = None):
     rep.p(f"Bi → 0 (кинетика):     Sh_D = {m0['Sh_D']:.4f}  (эталон 4,3636)")
     rep.p("Проверка тождества β₁ = 2 k_эф R / D: " +
           ", ".join(f"Bi={r[0]:.0e}: {r[4]/(2*r[2]*r[0]):.6f}" for r in sh_rows[::8] if r[2] > 0))
+    rep.p("k_эф = k_s/(1 + 2k_sR/(Sh_D·D)), Sh_D — по диаметру; диффузионный предел k_эф = Sh_D·D/(2R): " +
+          ", ".join(f"R={R*1e6:.0f} мкм → {SH_DIRICHLET*p.D/(2*R):.2e} м/с" for R in (250e-6, 500e-6)))
     write_csv(os.path.join(out, "sherwood_vs_Bi.csv"),
               ["Bi", "Sh_D", "keff_over_ks_exact", "keff_over_ks_series", "beta1"], sh_rows)
     rep.p("")
@@ -900,46 +1192,124 @@ def main(argv=None, params: Params | None = None):
         pp = replace(p, R=R)
         ks = float(pp.ks())
         ke = float(k_eff(ks, R, p.D))
+        qm20 = q_min(pp, 0.2)
         rows.append([f"{R*1e6:.0f}", fmt(pp.Bi), fmt(float(sh_of_bi(pp.Bi))), fmt(ke / ks),
                      fmt(da_eff(replace(pp, Q_ul_min=1.0))),
-                     fmt(q_min(pp, 0.2) / UL_MIN), fmt(q_min(pp, 0.1) / UL_MIN),
-                     fmt(q_min(pp, 0.1) / q_min(pp, 0.2))])
-    rep.table(["R, мкм", "Bi", "Sh_D", "k_эф/k_s", "Da_эф(1 мкл/мин)", "Q_min(20%)",
-               "Q_min(10%)", "отношение"], rows)
+                     fmt(qm20 / UL_MIN), fmt(q_min(pp, 0.1) / UL_MIN),
+                     fmt(qm20 / ks), fmt(qm20 / UL_MIN / (ks / 1e-7))])
+    rep.table(["R, мкм", "Bi", "Sh_D", "k_эф/k_s", "Da_эф(1 мкл/мин)", "Q_min(20%), мкл/мин",
+               "Q_min(10%)", "Q_min/k_s, м²", "Q_min/k_s, мкл/мин на 10⁻⁷ м/с"], rows)
+    rep.p("Q_min/k_s = 2πRL(k_эф/k_s)/(−ln(1−δ*)) не зависит от неизвестного k_s в кинетическом режиме.")
     rep.p(f"Пороги: δ*=20 % → Da ≤ {da_limit(0.2):.4f}; δ*=10 % → Da ≤ {da_limit(0.1):.4f}; "
           f"прежний Da=1,27 → δ = {100*(1-math.exp(-1.27)):.1f} %")
     rep.data["Qmin_ul_min"] = {r[0]: {"20%": r[5], "10%": r[6]} for r in rows}
 
+    rep.p("")
+    L_e = entry_length(p.Q, p.D)
+    z1 = max(L_e, wa["l_end_in"]); z2 = p.L - wa["l_end_out"]
+    rep.p(f"Неравномерность на рабочем участке R = {p.R*1e6:.0f} мкм: от z₁ = max(L_e, торец) = {z1*1e3:.2f} мм "
+          f"до z₂ = L − торец = {z2*1e3:.2f} мм:")
+    Tw_fun = lambda z: np.interp(z, wa["zc"], wa["Tc"])
+    rows = []
+    for label, Qv in (("Q_min(20 %)", q_min(p, 0.2) / UL_MIN), ("текущий Q", p.Q_ul_min)):
+        pq = replace(p, Q_ul_min=Qv)
+        zq1 = max(entry_length(pq.Q, p.D), wa["l_end_in"])
+        zz, J0 = deposition_profile(pq)
+        zz, JT = deposition_profile(pq, Tw_fun)
+        d0, _ = delta_working(zz, J0, zq1, z2)
+        dT1, dTm = delta_working(zz, JT, zq1, z2)
+        rows.append([label, fmt(Qv), fmt(da_eff(pq)), fmt(100 * float(nonuniformity(da_eff(pq)))),
+                     fmt(100 * d0), fmt(100 * dT1), fmt(100 * dTm)])
+    rep.table(["режим", "Q, мкл/мин", "Da_эф", "δ по всей L, %", "δ раб., T_w=const, %",
+               "δ раб. с T_w(z), %", "1−J_min/J_max, %"], rows)
+    rep.p("δ раб. = 1 − J(z₂)/J(z₁); вход z₁ = max(L_e, длина входной торцевой зоны).")
+    dTax = wa["dT_axial_work"]
+    lhs_cur = combined_lhs(da_eff(p), Ee_c, dTax, p.T_w)
+    qmc = q_min_combined(p, 0.2, dTax)
+    rep.p("")
+    rep.p(f"Совместный критерий Da_эф + E_эф·ΔT/(R_g·T_w²) ≤ −ln(1−δ*), ΔT = неоднородность T_w на рабочем "
+          f"участке = {dTax:.2f} K:")
+    rep.p(f"  тепловой вклад = {Ee_c*dTax/(R_GAS*p.T_w**2):.3f}; при текущем Q левая часть = {lhs_cur:.3f} "
+          f"(порог {da_limit(0.2):.3f}) → {'выполнен' if lhs_cur <= da_limit(0.2) else 'НЕ выполнен'}")
+    rep.p(f"  Q_min(совм., 20 %) = {qmc/UL_MIN:.3g} мкл/мин против Q_min(обеднение) = {q_min(p, 0.2)/UL_MIN:.3g} мкл/мин"
+          if math.isfinite(qmc) else "  тепловой вклад один превышает допуск: равномерность недостижима ни при каком Q")
+    qmc_ch = q_min_combined(p, 0.2, wa["dT_axial_channel"])
+    rep.p(f"  если не отсекать торцевые зоны (ΔT = {wa['dT_axial_channel']:.2f} K по всему каналу): " +
+          (f"Q_min = {qmc_ch/UL_MIN:.3g} мкл/мин" if math.isfinite(qmc_ch) else "недостижимо ни при каком Q"))
+    rep.p("  Торцевые зоны отсечены по |ΔT| > ΔT*, поэтому на рабочем участке ΔT ≈ ΔT* и тепловой вклад")
+    rep.p("  почти исчерпывает допуск; варианты с более жёстким отсечением — в разделе 5.")
+    rep.data["combined"] = {"dT_work": dTax, "lhs_current": lhs_cur, "Qmin_combined_ul_min": qmc / UL_MIN,
+                            "Qmin_combined_channel_ul_min": qmc_ch / UL_MIN}
+
     # ---------------- раздел 5 ----------------
-    rep.h("5. Тепловое управление: ΔT*")
+    rep.h("5. Тепловое управление: ΔT* и температура стенки в блоке")
     rows = []
     for E in (40e3, 60e3, 80e3):
         rows.append([f"{E/1e3:.0f}", fmt(float(delta_T_star(0.2, p.T_w, E))),
-                     fmt(float(delta_T_star(0.1, p.T_w, E))),
-                     fmt(float(delta_T_star(0.2, p.T_w, E, exact=True))),
-                     fmt(float(delta_T_star(0.1, p.T_w, E, exact=True)))])
-    rep.table(["E, кДж/моль", "ΔT*(20%), K", "ΔT*(10%), K", "точн.(20%)", "точн.(10%)"], rows)
-    rep.p("«точн.» — с -ln(1-δ*) вместо δ*: при 20 % отличие ≈ 12 %.")
+                     fmt(float(delta_T_star(0.1, p.T_w, E)))])
+    rep.table(["E, кДж/моль", "ΔT*(20%), K", "ΔT*(10%), K"], rows)
+    rep.p("ΔT* = −ln(1−δ*)·R_g·T_w²/E_эф (кинетический предел E_эф = E).")
     rep.p("")
-    pp = replace(p)
-    ks = float(pp.ks()); ke = float(k_eff(ks, pp.R, pp.D))
-    Ee = float(e_eff(pp.E, pp.E_D, ke / ks))
-    rep.p(f"Текущий режим R={pp.R*1e6:.0f} мкм: k_эф/k_s = {ke/ks:.4f}, E_эф = {Ee/1e3:.1f} кДж/моль, "
-          f"ΔT*(20 %) = {float(delta_T_star(0.2, pp.T_w, Ee)):.2f} K")
+    rep.p(f"Текущий режим R={p.R*1e6:.0f} мкм: k_эф/k_s = {ke_c/ks_c:.4f}, E_эф = {Ee_c/1e3:.1f} кДж/моль, "
+          f"ΔT*(20 %) = {dTs20:.2f} K")
     rep.p("")
-    rep.p(f"Ослабление стенкой δ_w = {p.delta_w*1e3:.1f} мм: " +
-          ", ".join(f"λ={lw*1e3:g} мм → {float(wall_attenuation(lw, p.delta_w)):.3f}"
-                    for lw in (2e-3, 5e-3, 10e-3, 25e-3)))
-    lf = fin_length(p)
-    rep.p(f"Длина теплового ребра l_f = sqrt(λ_w δ_w/h) = {lf*1e3:.1f} мм (h = {p.h_loss} Вт/м²К, оценка)")
-    for dTe in (2.0, 5.0, 10.0):
-        rep.p(f"  торцевой провал {dTe:g} K → зона с |ΔT| > ΔT*(20 %, E=60) длиной "
-              f"{end_zone_length(p, dTe, float(delta_T_star(0.2, p.T_w, 60e3)))*1e3:.1f} мм")
+    rep.p(f"Стационарное поле в блоке ({heat_name} {p.T_w-273.15:.0f} °C), T_w(z) на стенке канала:")
+    rows = [
+        ["T_w в середине канала, °C", fmt(wa["T_mid"] - 273.15)],
+        ["уставка − T_w(середина), K", fmt(wa["dev_from_set"])],
+        ["T_w на входе / выходе канала, °C", f"{wa['T_in_end']-273.15:.2f} / {wa['T_out_end']-273.15:.2f}"],
+        ["осевая неоднородность по каналу, K", fmt(wa["dT_axial_channel"])],
+        [f"торцевая зона у входа (|ΔT| > {dTs20:.2f} K), мм", fmt(wa["l_end_in"] * 1e3)],
+        ["торцевая зона у выхода, мм", fmt(wa["l_end_out"] * 1e3)],
+        ["рабочий участок без торцевых зон, мм", fmt(wa["L_work"] * 1e3)],
+        ["неоднородность на рабочем участке, K", fmt(wa["dT_axial_work"])],
+        ["k_s(T_w середина)/k_s(уставка)", fmt(float(p.ks(wa["T_mid"]) / p.ks()))],
+    ]
+    rep.table(["величина", "значение"], rows)
+    rep.p("")
+    rep.p("Порог отсечения торцевых зон θ·ΔT*: длина рабочего участка и Q_min по совместному критерию (δ* = 20 %):")
+    rows = []
+    cut_rows = []
+    for th_ in (1.0, 0.75, 0.5, 0.25):
+        wq = wall_profile_analysis(p, blk0, th_ * dTs20)
+        dTw = wq["dT_axial_work"]
+        qc = q_min_combined(p, 0.2, dTw)
+        rows.append([f"{th_:g}", fmt(th_ * dTs20), fmt(wq["l_end_in"] * 1e3), fmt(wq["L_work"] * 1e3),
+                     fmt(dTw), fmt(Ee_c * dTw / (R_GAS * p.T_w ** 2)),
+                     fmt(qc / UL_MIN) if math.isfinite(qc) else "недостижимо"])
+        cut_rows.append({"theta": th_, "L_work_mm": wq["L_work"] * 1e3, "dT_work": dTw,
+                         "Qmin_comb_ul_min": qc / UL_MIN})
+    rep.table(["θ", "порог, K", "торец, мм", "раб. участок, мм", "ΔT раб., K", "тепловой вклад",
+               "Q_min совм., мкл/мин"], rows)
+    rep.p(f"Для сравнения: Q_min без тепловой неоднородности = {q_min(p, 0.2)/UL_MIN:.3g} мкл/мин.")
+    rep.data["end_zone_cut"] = cut_rows
+    rep.p("")
+    rep.p(f"Местный провал T_w от притока холодного золя ({p.T_in-273.15:.0f} °C, вход снизу, сквозное отверстие):")
+    rows = []
+    dips = {}
+    zc_full = blk0["z"] - p.z_ch0
+    mch = (zc_full >= 0) & (zc_full <= p.L)
+    for Qv in (0.1, 0.3, 1.0, 2.0):
+        bq = block_temperature(p, Qv, Nz=Nz_blk)
+        dip = (blk0["Tw"] - bq["Tw"])
+        dips[Qv] = dip
+        zch = np.linspace(0.0, p.L, 1001); dch = np.interp(zch, zc_full, dip)
+        mw = (zch >= wa["l_end_in"]) & (zch <= p.L - wa["l_end_out"])
+        over = zch[dch > 0.1]
+        rows.append([fmt(Qv), fmt(float(dch[0])), fmt(float(dch.max())),
+                     fmt(float(dch[mw].max()) if mw.any() else float("nan")),
+                     fmt(float(over.max() * 1e3) if over.size else 0.0),
+                     fmt(float(max(-dch.min(), 0.0)))])
+    rep.table(["Q, мкл/мин", "провал на входе канала, K", "max провал в канале, K",
+               "max провал на раб. участке, K", "провал > 0,1 K до z, мм", "max подогрев ниже по потоку, K"],
+              rows)
+    rep.p("Провал отсчитывается от поля без протока; z — от входа канала. Ниже по потоку золь,")
+    rep.p("нагретый у входа, слегка подогревает стенку (отрицательный провал).")
+    rep.data["inlet_dip"] = {str(k): float(v[mch].max()) for k, v in dips.items()}
     rep.p("")
     for dT in (10.0, 20.0):
-        lin, ex = selectivity(60e3, dT, p.T_w)
-        rep.p(f"Избирательность локального нагрева, E = 60, ΔT = {dT:g} K: "
-              f"линеаризованная {lin:.2f}, точная {ex:.2f}")
+        rep.p(f"Избирательность локального нагрева (точный Аррениус), E = 60 кДж/моль, ΔT = {dT:g} K: "
+              f"{selectivity(60e3, dT, p.T_w):.2f}")
 
     # ---------------- раздел 6 ----------------
     rep.h("6. Статический режим и сужение")
@@ -949,26 +1319,41 @@ def main(argv=None, params: Params | None = None):
         rows.append([f"{R*1e6:.0f}", fmt(mm * 1e3), fmt(mm / p.rho_layer * 1e6)])
     rep.table(["R, мкм", "m_max, г/м²", "h_экв, мкм"], rows)
     rep.p("")
-    pp = replace(p)
-    kst = k_eff_static(pp)
-    Dast = 2 * kst * pp.t_gel / pp.R
-    fr = float(static_deposit_fraction(pp.t_gel, pp)[0])
-    rep.p(f"R=250 мкм: k_эф(статика, 1-я мода) = {kst:.3e} м/с, Da_ст = {Dast:.3f}, "
+    kst = k_eff_static(p)
+    Dast = 2 * kst * p.t_gel / p.R
+    fr = float(static_deposit_fraction(p.t_gel, p)[0])
+    rep.p(f"R={p.R*1e6:.0f} мкм: k_эф(статика, 1-я мода) = {kst:.3e} м/с, Da_ст = {Dast:.3f}, "
           f"m(t_gel)/m_max = {fr:.3f} (ряд), {float(static_first_mode_fraction(Dast)):.3f} (1-я мода)")
-    lam, A = static_modes(pp.Bi, 30)
+    lam, A = static_modes(p.Bi, 30)
     rep.p(f"Сумма весов мод = {A.sum():.6f} (должна быть 1)")
+    rep.p("")
+    rep.p(f"Толщина плотного SiO₂ (ρ = {p.rho_layer:.0f} кг/м³) за один залив, порог растрескивания "
+          f"{CRACK_THICKNESS*1e6:g} мкм:")
+    rows = []
+    for R in (50e-6, 250e-6, 500e-6):
+        pr = replace(p, R=R)
+        f_st = float(static_deposit_fraction(p.t_gel, pr)[0])
+        h1 = fill_thickness(1.0, c0, p.rho_layer, R)
+        hf = fill_thickness(f_st, c0, p.rho_layer, R)
+        rows.append([f"{R*1e6:.0f}", fmt(h1 * 1e6), fmt(f_st), fmt(hf * 1e6),
+                     "выше порога" if hf > CRACK_THICKNESS else "ниже порога",
+                     fmt(min(1.0, CRACK_THICKNESS / h1))])
+    rep.table(["R, мкм", "h₁(f=1), мкм", "f = m(t_gel)/m_max", "h₁(f), мкм", "сравнение с 1 мкм",
+               "допустимая доля f"], rows)
     rep.p("")
     eps1 = narrowing_epsilon(1.0, c0, p.rho_layer)
     rep.p(f"ε (f=1) = {eps1:.4f};  циклов 50 → 0,5 мкм: f=1: {n_cycles(50, 0.5, eps1):.0f}, "
           f"f=0,5: {n_cycles(50, 0.5, narrowing_epsilon(0.5, c0, p.rho_layer)):.0f}")
+    l_pinch = 0.5e-3
     rows = []
     for r in (50e-6, 5e-6, 1e-6, 0.5e-6):
-        rows.append([fmt(r * 1e6), fmt(dp_poiseuille(0.1 * UL_MIN, r, 25e-3, p.mu) / 1e5),
-                     fmt(dp_poiseuille(0.1 * UL_MIN, r, 0.5e-3, p.mu) / 1e5)])
-    rep.p("Перепад давления при Q = 0,1 мкл/мин, μ = 1 мПа·с:")
-    rep.table(["R, мкм", "Δp канал 25 мм, бар", "Δp пережим 0,5 мм, бар"], rows)
-    ratio = (0.5e-3 / (0.5e-6) ** 4) / (24.5e-3 / (50e-6) ** 4)
-    rep.p(f"Сопротивление пережима (0,5 мм, 0,5 мкм) / остального канала (24,5 мм, 50 мкм) = {ratio:.2e}")
+        rows.append([fmt(r * 1e6), fmt(dp_poiseuille(0.1 * UL_MIN, r, p.L, p.mu) / 1e5),
+                     fmt(dp_poiseuille(0.1 * UL_MIN, r, l_pinch, p.mu) / 1e5)])
+    rep.p(f"Перепад давления при Q = 0,1 мкл/мин, μ = {p.mu*1e3:g} мПа·с:")
+    rep.table(["R, мкм", f"Δp канал {p.L*1e3:g} мм, бар", f"Δp пережим {l_pinch*1e3:g} мм, бар"], rows)
+    ratio = (l_pinch / (0.5e-6) ** 4) / ((p.L - l_pinch) / (50e-6) ** 4)
+    rep.p(f"Сопротивление пережима ({l_pinch*1e3:g} мм, 0,5 мкм) / остального канала "
+          f"({(p.L-l_pinch)*1e3:g} мм, 50 мкм) = {ratio:.2e}")
     rq = r_for_permeability(1e-15, 0.1, 2.0)
     kkc = kozeny_carman(100e-9, 0.4)
     rep.p(f"Пучок капилляров: k = 1e-15 м² при φ=0,1, τ=2 → r = {rq*1e6:.2f} мкм")
@@ -990,7 +1375,8 @@ def main(argv=None, params: Params | None = None):
     rep.p(f"    Sh_числ(ζ = {zz[-1]:.2f}) = {sh_loc[-1]:.4f} (асимптота 3,6568)")
     lev = (zz, sh_loc)
     # (2) c̄(z) и J(z)
-    rep.p("(2) Сравнение c̄(z) с аналитикой exp(-2k_эф z/(Rū)) на z > L_e:")
+    zeta_e = 0.2                          # ζ_e = L_e·D/(ū R²) = 0,2
+    rep.p("(2) Сравнение c̄(z) с аналитикой exp(-2k_эф z/(Rū)) на z > L_e; δ = 1 − J(L)/J(L_e):")
     rows = []
     for Bi in (0.01, 0.1, 1.0, 10.0):
         mode = graetz_first_mode(Bi)
@@ -999,29 +1385,43 @@ def main(argv=None, params: Params | None = None):
             res = march_solution(Bi, zeta_L, N=N, n_out=200, zeta_min=zeta_L * 1e-4)
             ze = res["zeta"]
             an_exact = np.exp(-mode["beta1"] * ze)
-            mask = ze > 0.2              # ζ_e = L_e D/(ū R²) = 0,2
-            err = (fmt(100 * np.max(np.abs(res["cb"][mask] / an_exact[mask] - 1)))
-                   if mask.any() else "L < L_e")
-            delta_num = 1 - res["j"][-1] / res["j"][1]
-            rows.append([f"{Bi:g}", f"{Da_target:g}", err,
-                         fmt(100 * delta_num), fmt(100 * (1 - math.exp(-Da_target))),
-                         fmt(float(np.max(np.abs(res["balance"])))) ])
-    rep.table(["Bi", "Da_эф", "max ош. c̄, % (z>L_e)", "δ числ., %", "δ анал., %",
-               "|баланс|"], rows)
-    rep.p("    δ числ. = 1 − J(L)/J(0⁺); у входа J выше из-за участка Левека.")
-    rep.p("    В рабочем диапазоне ζ_L = πLD/Q = 2,4…47, поэтому Da_эф ≤ 0,223 требует β₁ ≤ 0,09,")
-    rep.p("    т. е. Bi ≲ 0,05: критерий равномерности выполним только в кинетическом режиме,")
-    rep.p("    где входной участок вносит < 1 % (строки Bi = 0,01–0,1).")
-    # (3) квазиизотермичность
-    th = thermal_fill_check(p)
+            mask = ze > zeta_e
+            if mask.any():
+                err = fmt(100 * np.max(np.abs(res["cb"][mask] / an_exact[mask] - 1)))
+                Je = float(np.interp(zeta_e, ze, res["j"]))
+                d_num = fmt(100 * (1 - res["j"][-1] / Je))
+                d_an = fmt(100 * (1 - math.exp(-Da_target * (1 - zeta_e / zeta_L))))
+            else:
+                err = d_num = d_an = "L < L_e"
+            rows.append([f"{Bi:g}", f"{Da_target:g}", err, d_num, d_an,
+                         fmt(float(np.max(np.abs(res["balance"]))))])
+    rep.table(["Bi", "Da_эф", "max ош. c̄, % (z>L_e)", "δ числ., %", "δ анал., %", "|баланс|"], rows)
+    rep.p("    δ анал. = 1 − exp(−Da_эф·(1 − L_e/L)) — тот же участок от L_e до L.")
+    zl_lo, zl_hi = math.pi * p.L * p.D / (2 * UL_MIN), math.pi * p.L * p.D / (0.1 * UL_MIN)
+    rep.p(f"    В рабочем диапазоне ζ_L = πLD/Q = {zl_lo:.1f}…{zl_hi:.0f}, поэтому Da_эф ≤ 0,223 требует "
+          f"β₁ ≤ {0.223/zl_lo:.2f},")
+    rep.p("    т. е. Bi ≲ 0,05: критерий равномерности выполним только в кинетическом режиме.")
+    # (3) квазиизотермичность с толстой стенкой
+    rep.p(f"(3) Холодный золь ({p.T_in-273.15:.0f} °C) заполняет канал в прогретом блоке "
+          f"(стенка до R_б = {p.R_block*1e3:g} мм, {p.T_w-273.15:.0f} °C):")
     rows = []
-    for tt in (0.5, 1, 2, 5, 10, 20):
-        k = np.searchsorted(th["t"], tt)
-        rows.append([fmt(tt), fmt(th["max_dev_sol"][k]), fmt(p.T_w - th["T_inner_wall"][k])])
-    rep.p("(3) Холодный золь (20 °C) заполняет канал с прогретой стенкой (60 °C), R = 250 мкм:")
-    rep.table(["t, с", "max|T_w − T_золь|, K", "провал T внутр. стенки, K"], rows)
-    t01 = th["t"][np.argmax(th["max_dev_sol"] < 0.1)]
-    rep.p(f"    max отклонение < 0,1 K через t ≈ {t01:.1f} с")
+    fills = {}
+    for R in (250e-6, 500e-6):
+        th = thermal_fill_check(replace(p, R=R), t_end=3000.0)
+        fills[R] = th
+    for tt in (0.5, 1, 5, 10, 30, 60, 120, 300):
+        row = [fmt(tt)]
+        for R in (250e-6, 500e-6):
+            th = fills[R]
+            k = min(np.searchsorted(th["t"], tt), len(th["t"]) - 1)
+            row += [fmt(th["max_dev_sol"][k]), fmt(p.T_w - th["T_inner_wall"][k])]
+        rows.append(row)
+    rep.table(["t, с", "max|ΔT| золь (250), K", "провал стенки (250), K",
+               "max|ΔT| золь (500), K", "провал стенки (500), K"], rows)
+    for R, th in fills.items():
+        rep.p(f"    R = {R*1e6:.0f} мкм: отклонение < 0,1 K через {th['t_below_0p1']:.0f} с; "
+              f"оценка «линейного стока» E'/(4πλ_w·0,1 K) = {th['line_sink_t01']:.0f} с")
+    rep.data["fill_t01"] = {f"{R*1e6:.0f}": th["t_below_0p1"] for R, th in fills.items()}
     # (4) сеточная сходимость
     rep.p("(4) Сеточная сходимость (Bi = 1, Da_эф = 1): c̄(L)")
     mode = graetz_first_mode(1.0)
@@ -1035,8 +1435,22 @@ def main(argv=None, params: Params | None = None):
                      fmt(float(np.max(np.abs(res["balance"]))))])
         prev = val
     rep.table(["N", "c̄(L)/c0", "|Δ| к пред.", "|баланс|"], rows)
+    rep.p("    Блок: сходимость T_w(середина) по сетке:")
+    rows = []
+    for nzb, drm in ((100, 8e-4), (200, 4e-4), (400, 2e-4)):
+        bb = block_temperature(p, 0.0, Nz=nzb, dr_max=drm)
+        ww = wall_profile_analysis(p, bb, dTs20)
+        rows.append([nzb, fmt(drm * 1e3), f"{ww['T_mid']-273.15:.4f}", fmt(ww["dT_axial_channel"]),
+                     fmt(ww["l_end_in"] * 1e3)])
+    rep.table(["Nz", "dr_max, мм", "T_w(середина), °C", "ΔT по каналу, K", "торец, мм"], rows)
+    if p.heating == "side":
+        pts = (("середина", p.H_block / 2), ("вход канала", p.z_ch0))
+        rep.p("    Блок: сравнение с аналитическим рядом (без канала): " + "; ".join(
+            f"{nm}: {np.interp(zp, blk0['z'], blk0['Tw'])-273.15:.3f} / "
+            f"{block_side_analytic(p, p.R, zp)-273.15:.3f} °C" for nm, zp in pts))
     # (5) чувствительность
-    rep.p("(5) Чувствительность Q_min(δ*=20 %) и ΔT*(20 %) к k_s(T_w), E, D (R = 250 мкм):")
+    rep.p("(5) Чувствительность Q_min(δ*=20 %) и ΔT*(20 %) к k_s(T_w), E, D "
+          f"(R = {p.R*1e6:.0f} мкм):")
     rows = []
     sens = []
     for ksr in (1e-8, 1e-7, 1e-6):
@@ -1053,37 +1467,55 @@ def main(argv=None, params: Params | None = None):
     write_csv(os.path.join(out, "sensitivity.csv"),
               ["ks_Tw_m_s", "D_m2_s", "E_kJ_mol", "Qmin_ul_min", "dTstar_K", "keff_over_ks"], sens)
     # (6) подвижная граница
-    rep.p("(6) Подвижная граница: R0 = 50 мкм, L = 25 мм, Da_эф(0) = 0,5")
+    rep.p(f"(6) Подвижная граница: R0 = 50 мкм, L = {p.L*1e3:g} мм, Da_эф(0) = 0,5")
     pmb = replace(p, R=50e-6)
+    Nmb = 150 if args.quick else 300
     mb = {}
     for mode_ in ("Q", "dp"):
-        mb[mode_] = moving_boundary(pmb, mode_, 50e-6, 0.5, R_stop_frac=0.4,
-                                    Nz=150 if args.quick else 300)
+        mb[mode_] = moving_boundary(pmb, mode_, 50e-6, 0.5, R_stop_frac=0.4, Nz=Nmb)
+    name = {"Q": "Q=const", "dp": "Δp=const"}
+    rep.p("  Накопленная неравномерность (профиль R(z)):")
     rows = []
     for mode_, res in mb.items():
         for frac, (t, R, qr, jr) in sorted(res["snaps"].items(), reverse=True):
-            rows.append(["Q=const" if mode_ == "Q" else "Δp=const", fmt(frac), fmt(t / 3600),
-                         fmt((R.max() - R.min()) / R.max()), fmt(R[-1] / R[0]), fmt(qr), fmt(jr)])
-    rep.table(["режим", "min R/R0", "t, ч", "(Rmax−Rmin)/Rmax", "R(L)/R(0)", "Q/Q0",
-               "J(L)/J(0)"], rows)
-    rep.p("    J(L)/J(0) — мгновенная равномерность потока: при Q = const растёт к 1")
-    rep.p("    (скорость роста неравномерности падает), при Δp = const падает (зарастание со входа).")
-    rep.p("    Накопленная относительная неравномерность R растёт в обоих режимах.")
-    rep.p(f"    Q0 = {mb['Q']['Q0']/UL_MIN:.3f} мкл/мин, Δp0 = {mb['dp']['dp0']:.1f} Па")
+            rows.append([name[mode_], fmt(frac), fmt(t / 3600), fmt(R[-1] / R[0]),
+                         fmt((R.max() - R.min()) / R.max())])
+    rep.table(["режим", "min R/R0", "t, ч", "R(L)/R(0)", "(Rmax−Rmin)/Rmax"], rows)
+    rep.p("  Мгновенная неравномерность (поток в данный момент):")
+    rows = []
+    for mode_, res in mb.items():
+        for frac, (t, R, qr, jr) in sorted(res["snaps"].items(), reverse=True):
+            rows.append([name[mode_], fmt(frac), fmt(t / 3600), fmt(jr), fmt(qr)])
+    rep.table(["режим", "min R/R0", "t, ч", "J(L)/J(0)", "Q/Q0"], rows)
+    rep.p("    При Q = const J(L)/J(0) растёт к 1, но R(L)/R(0) всё равно растёт: накопленная")
+    rep.p("    неравномерность не выравнивается. При Δp = const обе ухудшаются.")
+    rep.p(f"    Q0 = {mb['Q']['Q0']/UL_MIN:.3f} мкл/мин, Δp0 = {mb['dp']['dp0']:.1f} Па (L = {p.L*1e3:g} мм)")
+    rep.p("  Сходимость по шагу времени (снимок min R/R0 = 0,4):")
+    rows = []
+    for mode_ in ("Q", "dp"):
+        ref = None
+        for cfl in (0.004, 0.002, 0.001):
+            rr = mb[mode_] if cfl == 0.002 else moving_boundary(pmb, mode_, 50e-6, 0.5, R_stop_frac=0.4,
+                                                               Nz=Nmb, cfl=cfl)
+            t4, R4, q4, j4 = rr["snaps"][0.4]
+            val = R4[-1] / R4[0]
+            rows.append([name[mode_], f"{cfl:g}", rr["nsteps"], fmt(t4 / 3600), f"{val:.5f}", f"{j4:.5f}",
+                         "" if ref is None else fmt(abs(val - ref))])
+            ref = val
+    rep.table(["режим", "dt/(R/|Ṙ|)", "шагов", "t, ч", "R(L)/R(0)", "J(L)/J(0)", "|Δ| к пред."], rows)
 
     # ---------------- сверка с планом ----------------
     rep.h("Сверка с планом")
-    checks = []
     ts250 = time_scales(replace(p, R=250e-6)); ts500 = time_scales(replace(p, R=500e-6))
-    checks += [
+    pe = [thermal_peclet(replace(p, R=R, Q_ul_min=Q)) for R in (250e-6, 500e-6) for Q in (0.1, 2.0)]
+    checks = [
         ("c0, моль/л", 1.3, c0 / 1e3),
         ("R²/a, R=250, с", 0.7, ts250["t_heat_sol"]),
         ("R²/a, R=500, с", 2.8, ts500["t_heat_sol"]),
         ("R²/D, R=250, с", 60, ts250["t_diff_radial"]),
-        ("L/ū max, R=500, с", 11800, ts500["t_res_max"]),
+        (f"L/ū max, R=500, с (L = {p.L*1e3:g} мм)", 11800, ts500["t_res_max"]),
         ("L_e(Q=2), мм", 2.0, entry_length(2 * UL_MIN, p.D) * 1e3),
-        ("Pe_T (R=250, Q=2)", 0.15, thermal_peclet(replace(p, Q_ul_min=2.0))),
-        ("Pe_T (R=500, Q=2)", 0.15, thermal_peclet(replace(p, R=500e-6, Q_ul_min=2.0))),
+        ("Pe_T (R=250…500, Q=0,1…2)", (0.01, 0.5), (min(pe), max(pe))),
         ("Q_min(10%)/Q_min(20%)", 2.1, da_limit(0.2) / da_limit(0.1)),
         ("ΔT*(E=60, 20%), K", 3.1, float(delta_T_star(0.2, p.T_w, 60e3))),
         ("m_max(R=250), г/м²", 9.8, m_max(c0, 250e-6) * 1e3),
@@ -1092,18 +1524,27 @@ def main(argv=None, params: Params | None = None):
         ("Δp пережим r=0,5 мкм, бар", 340, dp_poiseuille(0.1 * UL_MIN, 0.5e-6, 0.5e-3, p.mu) / 1e5),
         ("сопротивление пережима / канала", 2e6, ratio),
         ("k Козени — Кармена, мкД", 10, kkc / DARCY * 1e6),
-        ("избирательность ΔT=10 K", 1.9, selectivity(60e3, 10, p.T_w)[0]),
+        ("избирательность ΔT=10 K", 1.9, selectivity(60e3, 10, p.T_w)),
+        ("избирательность ΔT=20 K", 3.4, selectivity(60e3, 20, p.T_w)),
     ]
+    TOL = 0.10
     rows = []
-    for name, plan, calc in checks:
-        dev = abs(calc / plan - 1)
-        rows.append([name, fmt(plan), fmt(calc), "ок" if dev < 0.15 else f"≠ ({100*dev:.0f} %)"])
+    for nm, plan, calc in checks:
+        if isinstance(plan, tuple):
+            ok = calc[0] >= plan[0] * (1 - TOL) and calc[1] <= plan[1] * (1 + TOL)
+            rows.append([nm, f"{fmt(plan[0])}–{fmt(plan[1])}", f"{fmt(calc[0])}–{fmt(calc[1])}",
+                         "ок" if ok else "≠"])
+        else:
+            dev = abs(calc / plan - 1)
+            rows.append([nm, fmt(plan), fmt(calc), "ок" if dev < TOL else f"≠ ({100*dev:.0f} %)"])
     rep.table(["величина", "в плане", "расчёт", ""], rows)
+    rep.p(f"Допуск совпадения {100*TOL:.0f} %. ΔT* в плане — линеаризованная (δ* вместо −ln(1−δ*));")
+    rep.p("по точной формуле при δ* = 20 %: " + " / ".join(f"{float(delta_T_star(0.2, p.T_w, E)):.1f}".replace(".", ",")
+          for E in (40e3, 60e3, 80e3)) + " K для E = 40 / 60 / 80 кДж/моль.")
     rep.p("")
-    rep.p("Определение Sh: в плане k_эф = k_s/(1 + k_sR/(Sh·D)) при Sh = 3,66–4,36.")
-    rep.p("Для Sh по диаметру (3,66–4,36) правильно k_эф = k_s/(1 + 2k_sR/(Sh·D)) и")
-    rep.p("диффузионный предел k_эф = Sh·D/(2R). Либо Sh по радиусу = 1,83–2,18.")
-    rep.p(f"Проверка: β₁(Bi→∞)/2 = {md['beta1']/2:.4f} = Sh_R; k_эф = β₁D/(2R).")
+    rep.p("Определение Sh в плане нужно исправить: k_эф = k_s/(1 + 2k_sR/(Sh_D·D)) при Sh_D = 3,66–4,36")
+    rep.p("(по диаметру), диффузионный предел k_эф = Sh_D·D/(2R).")
+    rep.p(f"Проверка: β₁(Bi→∞)/2 = {md['beta1']/2:.4f} = Sh по радиусу; k_эф = β₁D/(2R).")
     rep.data["plan_checks"] = [{"name": n, "plan": a, "calc": b} for n, a, b in checks]
 
     # ---------------- рисунки ----------------
@@ -1115,6 +1556,7 @@ def main(argv=None, params: Params | None = None):
         fig6_dTstar(p, figdir)
         fig7_static(p, mb, figdir)
         figS_checks(sh_rows, lev, figdir)
+        figS_wall(p, blk0, wa, dips, dTs20, figdir)
         rep.p("")
         rep.p(f"Рисунки сохранены в {figdir}/ (PNG 300 dpi и PDF).")
 
@@ -1133,8 +1575,11 @@ PARAM_INFO = {
     # имя: (подпись, единица в интерфейсе, множитель интерфейс -> СИ)
     "R": ("Радиус канала R", "мкм", 1e-6),
     "L": ("Длина канала L", "мм", 1e-3),
-    "delta_w": ("Толщина стенки δ_w", "мм", 1e-3),
-    "T_w": ("Температура стенки T_w", "°C", None),
+    "T_w": ("Уставка нагрева T_w", "°C", None),
+    "R_block": ("Радиус блока R_б", "мм", 1e-3),
+    "H_block": ("Высота блока H_б", "мм", 1e-3),
+    "T_air": ("Температура воздуха", "°C", None),
+    "T_in": ("Температура входящего золя", "°C", None),
     "Q_ul_min": ("Расход Q", "мкл/мин", 1.0),
     "D": ("Коэффициент диффузии D", "10⁻⁹ м²/с", 1e-9),
     "ks_ref": ("k_s при T_ref", "10⁻⁷ м/с", 1e-7),
@@ -1172,7 +1617,7 @@ def params_to_ui(p: Params | None = None) -> dict:
 
 
 def quick_estimates(p: Params, delta_star: float = 0.2) -> dict:
-    """Мгновенные аналитические оценки для текущих параметров."""
+    """Мгновенные оценки для текущих параметров (блок — на грубой сетке)."""
     ks = float(p.ks())
     Bi = p.Bi
     Sh = float(sh_of_bi(Bi))
@@ -1184,6 +1629,14 @@ def quick_estimates(p: Params, delta_star: float = 0.2) -> dict:
     kst = k_eff_static(p)
     Da_st = 2 * kst * p.t_gel / p.R
     regime = "кинетический" if Bi < 0.1 else ("диффузионный" if Bi > 10 else "смешанный")
+    dTs = float(delta_T_star(delta_star, p.T_w, Ee))
+    blk = block_temperature(p, 0.0, Nz=120, dr_max=8e-4)
+    wa = wall_profile_analysis(p, blk, dTs)
+    qm = q_min(p, delta_star)
+    qmc = q_min_combined(p, delta_star, wa["dT_axial_work"])
+    lhs = combined_lhs(Da, Ee, wa["dT_axial_work"], p.T_w)
+    u_qmin = qm / (math.pi * p.R ** 2)
+    f_st = float(static_deposit_fraction(p.t_gel, p)[0])
     return {
         "c0_mol_L": p.c0 / 1e3,
         "ks": ks, "Bi": Bi, "regime": regime, "Sh_D": Sh, "keff": ke, "keff_over_ks": ke / ks,
@@ -1191,20 +1644,30 @@ def quick_estimates(p: Params, delta_star: float = 0.2) -> dict:
         "L_e_mm": entry_length(p.Q, p.D) * 1e3,
         "Da_eff": Da, "delta_pct": 100 * float(nonuniformity(Da)),
         "Da_limit": da_limit(delta_star),
-        "Qmin_ul_min": q_min(p, delta_star) / UL_MIN,
+        "Qmin_ul_min": qm / UL_MIN,
         "Qmin10_ul_min": q_min(p, 0.1) / UL_MIN,
+        "Qmin_over_ks_m2": qm / ks,
+        "Qmin_comb_ul_min": qmc / UL_MIN if math.isfinite(qmc) else None,
+        "combined_lhs": lhs,
         "E_eff_kJ": Ee / 1e3,
-        "dTstar_K": float(delta_T_star(delta_star, p.T_w, Ee)),
-        "dTstar_exact_K": float(delta_T_star(delta_star, p.T_w, Ee, exact=True)),
-        "t_heat_sol": ts["t_heat_sol"], "t_heat_wall": ts["t_heat_wall"],
+        "dTstar_K": dTs,
+        "T_mid_C": wa["T_mid"] - 273.15, "dev_from_set_K": wa["dev_from_set"],
+        "dT_axial_channel_K": wa["dT_axial_channel"], "dT_axial_work_K": wa["dT_axial_work"],
+        "l_end_in_mm": wa["l_end_in"] * 1e3, "l_end_out_mm": wa["l_end_out"] * 1e3,
+        "L_work_mm": wa["L_work"] * 1e3,
+        "orientation": p.orientation,
+        "Ra": vertical_rayleigh(p, wa["grad_unstable_channel"]),
+        "Ra_c_low": RA_C_INSULATING, "Ra_c_high": RA_C_CONDUCTING,
+        "u_horiz_um_s": horizontal_pipe_velocity(p, wa["grad_max_channel"]) * 1e6,
+        "u_Qmin_um_s": u_qmin * 1e6,
+        "t_heat_sol": ts["t_heat_sol"], "t_heat_block": ts["t_heat_block"],
         "t_diff": ts["t_diff_radial"], "t_res": p.L / u,
         "m_max_g_m2": m_max(p.c0, p.R) * 1e3,
         "h_eq_um": m_max(p.c0, p.R) / p.rho_layer * 1e6,
+        "h_fill_um": fill_thickness(f_st, p.c0, p.rho_layer, p.R) * 1e6,
         "Da_st": Da_st,
-        "m_frac_tgel": float(static_deposit_fraction(p.t_gel, p)[0]),
+        "m_frac_tgel": f_st,
         "eps": narrowing_epsilon(1.0, p.c0, p.rho_layer),
-        "fin_length_mm": fin_length(p) * 1e3,
-        "u_nc_um_s": natural_convection_velocity(p, 3.0 / p.L) * 1e6,
     }
 
 
@@ -1215,6 +1678,7 @@ FIGURES = [
     ("fig5_Qmin_vs_Tw", "Рис. 5. Минимальный расход Q_min от T_w"),
     ("fig6_dTstar", "Рис. 6. Допустимая неоднородность ΔT* от k_эф/k_s"),
     ("fig7_static_narrowing", "Рис. 7. Статика, циклы сужения, профили R(z)"),
+    ("figS_wall_temperature", "T_w(z) в блоке: торцевые зоны и провал от притока золя"),
     ("figS_checks_Sh_Leveque", "Проверка: Sh(Bi) и решение Левека"),
 ]
 
